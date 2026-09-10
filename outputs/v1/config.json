@@ -1,0 +1,13 @@
+{
+ "model": {
+  "latent_dim": 256,
+  "up": "transpose",
+  "res_blocks": 0,
+  "variational": false
+ },
+ "loss": {
+  "w_mse": 1.0
+ },
+ "epochs": 30,
+ "lr": 0.001
+}

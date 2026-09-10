@@ -1,0 +1,667 @@
+<!doctype html><html><head><meta charset='utf-8'><title>NSSC DA Report</title><style>
+@page { size: A4; margin: 16mm 14mm; }
+body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 10pt; color: #1b1b1b; line-height: 1.45; }
+h1 { font-size: 17pt; color: #8a1c1c; border-bottom: 2px solid #8a1c1c; padding-bottom: 3px; margin-top: 26px; page-break-before: always; }
+.cover h1 { page-break-before: avoid; border: none; font-size: 22pt; margin-top: 60px; }
+h2 { font-size: 13pt; color: #333; margin-top: 18px; } h3 { font-size: 11pt; }
+.sub { color: #555; font-size: 12pt; margin: 2px 0; }
+figure { margin: 10px 0; page-break-inside: avoid; text-align: center; }
+figure img { max-width: 100%; max-height: 235mm; }
+figcaption { font-size: 8.5pt; color: #555; margin-top: 3px; }
+table { border-collapse: collapse; margin: 8px 0; font-size: 8pt; page-break-inside: auto; }
+th, td { border: 1px solid #ccc; padding: 2px 5px; text-align: left; } th { background: #f1e4e4; }
+tr.hl td { background: #fff3b0; font-weight: 600; }
+.final { background: #fff6d6; border: 2px solid #d9a400; border-radius: 6px; padding: 8px 14px; margin-top: 24px; }
+.answer { background: #fff3b0; border-left: 5px solid #d9a400; padding: 6px 10px; font-weight: 700; }
+code { font-size: 8.5pt; background: #f4f4f4; padding: 0 2px; }
+</style></head><body><div class="cover"><h1>Unsupervised Anomaly Detection in Mars HiRISE Orbital Imagery</h1>
+<p class="sub">NSSC 2026 · Data Analytics · IIT Kharagpur</p><p class="sub">OrbitIQ</p>
+<div class="final">
+<h3>Final answers</h3>
+<ul>
+<li><b>Model:</b> v3 - convolutional autoencoder trained from scratch; linear bottleneck → fixed-length
+256-d 1-D latent; loss = 0.84·(1−SSIM) + 0.16·L1 + 0.1·Gradient-L1; map-projection no-data wedges masked</li>
+<li><b>Novelty Score:</b> Isolation Forest s(x,n) on latents (higher = more anomalous), 500 trees × 5 seeds</li>
+<li><b>Statistical threshold:</b> modified z-score &gt; 3.5 (median + 3.5·MAD/0.6745) = <b>0.5293</b></li>
+<li><b>Crops flagged:</b> <b>86</b> of 10422 (0.83 %)</li>
+<li><b>Top-5 analysed in Phase 3:</b> sample_00849.jpg (0.587), sample_06917.jpg (0.582), sample_05849.jpg (0.580), sample_03423.jpg (0.579), sample_03383.jpg (0.577)</li>
+</ul></div>
+<h3>Key findings</h3><ol>
+<li>The decisive fix was <strong>not</strong> the loss but the data. Masking the map-projection no-data wedges
+   (v3) removed a nuisance mode that had made every v1/v2 flag a border crop. It turned a bimodal
+   score distribution into a unimodal one with a genuine tail.</li>
+<li>The flagged set contains <strong>clear non-Martian content</strong> (an aerial photograph of the Pentagon,
+   perfectly periodic grids), recognisable in Phase 3 by diffuse whole-frame reconstruction error.
+   It also contains <strong>rare genuine terrain</strong> (north-polar layered deposits, fresh deep craters),
+   which the metadata join (2.3) identifies as a terrain class concentrated in two polar
+   observations.</li>
+<li>The spatial bottleneck (v4) was tried and <strong>rejected</strong>, because its coordinates encoded local
+   brightness.</li>
+<li><strong>Limitations:</strong> small local sensor defects are missed by latent-space scoring (the residual
+   catches two of three), and recall for terrestrial content is incomplete (sample_05508).</li>
+</ol></div><h1>0. Data and sanity pass</h1><p><strong>Sanity-pass findings</strong></p>
+<ul>
+<li>10,422 single-channel 227×227 JPEG crops from 172 source observations; every crop maps to exactly
+  one <code>source_image_id</code> and every id has metadata (checked with <code>assert</code>).</li>
+<li>Pixel values span the full 0-255 range; we rescale by 1/255 to [0, 1] and use a sigmoid decoder output.</li>
+<li><strong>≈20 % of crops contain a solid-black no-data wedge</strong> (the map-projected edge of the HiRISE strip).
+  These are <em>normal</em> data, but they are the highest-contrast edges in the whole dataset, which matters
+  for both the reconstruction loss and the anomaly detector (see changelog).</li>
+<li>Very bright crops (frost / dust) exist and are genuine terrain, so a brightness heuristic
+  cannot separate anomalies - consistent with the organisers' warning.</li>
+</ul><figure><img src="../outputs/figures/fig01_random_batch.png"><figcaption>Fig 0.1 - Random batch</figcaption></figure><figure><img src="../outputs/figures/fig02_pixel_stats.png"><figcaption>Fig 0.2 - Per-crop intensity, contrast and no-data statistics</figcaption></figure><h2>0.2 No-data (map-projection) masking - introduced in v3</h2><p>v1 and v2 showed that the black map-projection wedges, which are <em>normal</em> data, dominated both the
+reconstruction loss and the latent space (see changelog). From v3 on, each crop gets a <strong>no-data
+mask</strong>. A pixel is masked if it belongs to a near-black (≤ 5) region that</p>
+<ul>
+<li>survives a 5×5 morphological opening, so thin dark lines are <em>not</em> masked. A dead sensor
+  column or a black streak could itself be an injected anomaly, and hiding it would be wrong.</li>
+<li>touches the crop border, because strip edges enter from outside the crop.</li>
+<li>covers at least 0.5 % of the crop.</li>
+</ul>
+<p>The mask is dilated by 2 px to cover JPEG ringing along the wedge edge. Masked pixels are filled
+with the median of the crop's valid pixels, which gives a flat, texture-free region with no
+razor-sharp edge. They are also <strong>excluded from the loss and from every reconstruction-error
+metric and heatmap</strong>. The filled image, not the original, is what the v3 encoder sees.</p><figure><img src="../outputs/figures/fig02b_nodata_masks.png"><figcaption>Fig 0.3 - No-data masks: projection wedges are masked; thin interior dark features are deliberately kept</figcaption></figure><h1>Phase 1 - Deep Latent Compression</h1><h2>1.1 Architecture design</h2><p><strong>Design.</strong> A convolutional autoencoder written from scratch in PyTorch (no pretrained weights,
+no transfer learning).</p>
+<ul>
+<li><strong>Encoder:</strong> five stride-2 3×3 convolutions (32→64→128→256→256 channels), BatchNorm + LeakyReLU.
+  227 → 114 → 57 → 29 → 15 → 8. Five halvings are the minimum that brings the map to 8×8, so the
+  deepest units have a receptive field covering a large part of the crop (whole craters, dune trains)
+  before the bottleneck.</li>
+<li><strong>Bottleneck (final model, v3):</strong> flatten (256×8×8 = 16,384) → <code>Linear</code> → <strong>fixed-length 1-D
+  latent vector of 256 floats</strong> (the Phase 2 input). The global linear layer lets every latent
+  coordinate combine evidence from the whole crop, so the code describes <em>what kind of scene</em> this
+  is (terrain type, texture class, relief).</li>
+<li><strong>Alternative tried and rejected (v4):</strong> a <em>spatial</em> bottleneck, a 1×1 convolution to an 8×8
+  grid × 4 channels flattened to the same 256-d vector. The aim was to keep small local defects
+  visible, but each coordinate then mostly encoded <em>local brightness</em>, so the Isolation Forest
+  isolated very bright or dark scenes instead of anomalies (see changelog). We therefore kept the
+  global code.</li>
+<li><strong>Decoder:</strong> mirror image: <code>Linear</code> (v4: 1×1 conv) back to the 8×8×256 map → five ×2
+  transposed-conv stages to 256×256, centre-crop to 227×227, sigmoid. Cropping (rather than odd
+  output-padding) keeps every stage a clean ×2.</li>
+<li>Stride-2 convolutions replace pooling so the network learns its own downsampling.</li>
+<li>The bottleneck type, latent size, loss and no-data handling are configurable because they change
+  across v1 → v4 (<code>CONFIGS</code>).</li>
+</ul><p>The latent size trades <strong>reconstruction fidelity</strong> (a larger code keeps more detail) against
+<strong>outlier separability</strong>. An Isolation Forest splits on randomly chosen coordinates. If many latent
+dimensions carry redundant or near-constant information, most random splits are wasted and the
+isolation depth of true outliers gets diluted. We trained the final configuration with d ∈ {64, 128,
+256, 512} (short schedule) and measured three things:</p>
+<ul>
+<li>held-out SSIM (fidelity)</li>
+<li>the number of principal components needed for 90 % of latent variance (how much of the code is used)</li>
+<li>a label-free separability proxy: the <em>tail ratio</em> (99.9th-percentile Novelty Score − median) / MAD.
+  This measures how far the most isolated crops sit from the bulk, in robust units.</li>
+</ul><table><thead><tr><th>latent_dim</th><th>epochs</th><th>val_mse</th><th>val_ssim</th><th>pca90</th><th>tail_ratio</th><th>n_flag_mad35</th></tr></thead><tbody><tr><td>64</td><td>12</td><td>0.0027</td><td>0.6822</td><td>30</td><td>10.8869</td><td>868</td></tr><tr><td>128</td><td>12</td><td>0.0029</td><td>0.6781</td><td>8</td><td>9.5130</td><td>641</td></tr><tr><td>256</td><td>12</td><td>0.0023</td><td>0.6920</td><td>85</td><td>11.0490</td><td>828</td></tr><tr><td>512</td><td>12</td><td>0.0023</td><td>0.6961</td><td>109</td><td>10.4945</td><td>687</td></tr></tbody></table><figure><img src="../outputs/figures/fig03_latent_sweep.png"><figcaption>Fig 1.1 - Latent dimensionality sweep</figcaption></figure><p><strong>Choice: d = 256.</strong> The sweep uses a short 12-epoch schedule and a single seed, so its flagged
+counts are not comparable with the fully trained model and are shown only for completeness. The
+differences are indicative, not conclusive.</p>
+<ul>
+<li><strong>Fidelity saturates.</strong> Held-out SSIM is 0.682 (64), 0.678 (128), 0.692 (256) and 0.696 (512).
+  Doubling from 256 to 512 buys only +0.004.</li>
+<li><strong>Effective dimensionality grows sub-linearly.</strong> 30, 8, 85 and 109 principal components hold 90 %
+  of the latent variance. Going to 512 adds 256 coordinates but only about 24 effective directions.
+  The rest are redundant, and redundant coordinates <strong>dilute an Isolation Forest</strong>, whose splits pick
+  a coordinate uniformly at random.</li>
+<li><strong>Separability peaks at 256.</strong> The tail ratio is 10.9, 9.5, 11.0 and 10.5. The correlation with the
+  no-data fraction (the nuisance removed in v3) creeps up with size (0.03 → 0.08), because a bigger
+  code has room to re-encode fill geometry.</li>
+<li><strong>d = 128 is an outlier.</strong> 90 % of its variance sits in only 8 components, a partial collapse
+  under the short schedule, and it has the weakest tail.</li>
+</ul>
+<p>So 256 is the knee of the trade-off: the smallest code at which reconstruction fidelity is
+essentially saturated and the separability proxy is at its maximum.</p><h2>1.2 Loss function design</h2><p><strong>Loss design.</strong> v1 used pure MSE. MSE is minimised by the conditional mean, so when fine texture
+(dune ripples, crater rims, polygonal ground) is uncertain the decoder outputs a blurred average.
+The v1 reconstructions show this clearly (Fig 1.2). From v2 on, the objective is
+<strong>0.84·(1 − SSIM) + 0.16·L1 + 0.1·Gradient-L1</strong>, computed only on valid (non-no-data) pixels from v3 on.
+Its fully differentiable terms (weights in <code>CONFIGS</code>) complement each other:</p>
+<ul>
+<li><strong>(1 − SSIM)</strong> with an 11×11 Gaussian window (σ = 1.5) compares local mean, contrast and structure.
+  It penalises the loss of local structure even when the average brightness is right, which directly
+  targets blur on ridges and crater rims.</li>
+<li><strong>MSE / L1</strong> anchors absolute brightness. SSIM is insensitive to uniform intensity offsets, so on
+  its own it can drift in albedo.</li>
+<li><strong>Gradient L1</strong> (finite-difference edges) penalises smeared or misplaced high-frequency edges,
+  which helps sharp linear features such as ridgelines and scarps.</li>
+</ul>
+<p>No perceptual loss is used, because every perceptual network we could use would be pretrained, and
+that is banned.</p>
+<p><strong>What the iterations taught us about this loss.</strong> Switching from MSE (v1) to this combination (v2)
+sharpened crater rims and scarps, but it did <strong>not</strong> recover dune-ripple texture: held-out SSIM only
+went from 0.705 to 0.707. The binding constraint is the bottleneck, not the loss. 256 floats for
+51,529 pixels cannot store the exact phase of a ripple field, and a loss cannot recreate information
+the code has discarded. We keep the structural loss because it spends the unavoidable error on
+texture detail rather than on structure. Its edge sensitivity, however, made the network lock onto
+the razor-sharp edges of the no-data wedges (v2's novelty correlated 0.66 with the no-data share).
+That is why, from v3 on, every term is computed on valid pixels only (Section 0.2).</p><figure><img src="../outputs/figures/fig04_training_curves.png"><figcaption>Fig 1.2a - Training curves of v1-v4</figcaption></figure><figure><img src="../outputs/figures/fig05_recon_versions.png"><figcaption>Fig 1.2b - Reconstructions across versions</figcaption></figure><h2>1.3 Latent space visualisation</h2><p>PCA (50 components on standardised latents) followed by t-SNE (perplexity 40). Colouring by simple
+image properties the model never saw as labels shows <em>which</em> factors of variation the latent space
+organises. This is a qualitative diagnostic only, not proof of geological clusters.</p><figure><img src="../outputs/figures/fig06_tsne_properties.png"><figcaption>Fig 1.3a - t-SNE of final latents coloured by image properties</figcaption></figure><figure><img src="../outputs/figures/fig07_tsne_thumbs.png"><figcaption>Fig 1.3b - t-SNE with nearest-crop thumbnails</figcaption></figure><p><strong>Reading the map (visual interpretation, not labels).</strong></p>
+<ul>
+<li><strong>No collapse.</strong> The projection is not one structureless blob. It has a dense core, extended
+  arms and several small isolated islands.</li>
+<li><strong>Brightness is the dominant organising axis.</strong> Mean intensity changes smoothly from bright
+  (lower left) to dark (upper right). Contrast varies more locally.</li>
+<li><strong>Pixel scale is encoded too.</strong> Crops from the single 1 m/px observation concentrate in one
+  region at the top right, and 0.5 m/px crops are over-represented on the right-hand side. The same
+  terrain imaged at a coarser scale has a different texture frequency.</li>
+<li><strong>The no-data fraction is spread uniformly.</strong> This is visual confirmation that v3's masking
+  removed the border nuisance that dominated v1 and v2.</li>
+<li>The thumbnails show coherent neighbourhoods rather than discrete clusters: knobby and rough
+  terrain on the left, cratered plains in the centre, ripples and dunes, bright etched or polygonal
+  ground, and smooth dusty slopes. It is a continuum of terrain types.</li>
+<li>After thresholding (Fig 1.3c, produced in Section 2.2), high Novelty Scores lie on the
+  <strong>periphery and in the small islands</strong>, and the dense core scores low, as expected if the
+  Isolation Forest isolates sparse regions. Flagged crops concentrate at the bright lower edge and
+  the dark upper-right edge, which is the visible trace of v3's residual brightness bias
+  (changelog, v4 entry).</li>
+</ul><figure><img src="../outputs/figures/fig09_tsne_flagged.png"><figcaption>Fig 1.3c - Flagged crops on the t-SNE map</figcaption></figure><h1>Phase 2 - Isolation Forest Novelty Engine</h1><h2>2.1 Novelty scoring</h2><p>The Isolation Forest is fitted on the 1-D latent vectors of <strong>all</strong> crops (unsupervised: there is no
+"clean" training set). We use 500 trees and 256-sample sub-sampling (the original paper's
+recommended ψ), and average 5 forests with different seeds to reduce the variance of the ranking.</p>
+<p><strong>Score convention.</strong> sklearn's <code>score_samples</code> returns the <em>negated</em> anomaly score (higher = more
+normal). We negate it, so our <strong>Novelty Score = s(x, n) ∈ (0, 1] from Liu et al. (2008), and higher
+= more anomalous</strong>. This is the competition convention, and it is verified below by the sign of the
+correlation with sklearn's <code>decision_function</code>.</p><h2>2.2 Statistical thresholding</h2><p>We want the boundary to come from the <strong>shape of the observed score distribution</strong>, not from an
+assumed count. First we test whether a Gaussian μ + kσ rule is even appropriate (skewness, kurtosis,
+D'Agostino K² test, Q-Q plot). Then we compare three distribution-driven rules:</p>
+<ol>
+<li><strong>Robust modified z-score</strong> (Iglewicz &amp; Hoaglin 1993): M = 0.6745 (s − median) / MAD, flag
+   M &gt; 3.5. Median and MAD have a 50 % breakdown point, so the outliers being hunted cannot inflate
+   the threshold. Under normality 0.6745 × MAD estimates σ, so 3.5 is comparable to ≈3.5σ.</li>
+<li><strong>Kneedle elbow</strong> of the ascending sorted-score curve: min-max normalise both axes and take the
+   point of maximum vertical distance below the chord joining the end points. This is the point of
+   maximum curvature, where the curve turns from "bulk" to "tail".</li>
+<li><strong>Two-component Gaussian mixture</strong>: the score where the posterior of the high-mean component
+   exceeds 0.5.</li>
+</ol><table><thead><tr><th>mean</th><th>std</th><th>median</th><th>mad</th><th>skew</th><th>excess_kurtosis</th><th>normality_p</th></tr></thead><tbody><tr><td>0.4229</td><td>0.0345</td><td>0.4165</td><td>0.0217</td><td>0.9619</td><td>0.9827</td><td>0.0000</td></tr></tbody></table><table><thead><tr><th>method</th><th>threshold</th><th>n_flagged</th></tr></thead><tbody><tr class="hl"><td>Modified z-score (median + 3.5 MAD/0.6745)</td><td>0.5293</td><td>86</td></tr><tr><td>Kneedle elbow of sorted scores</td><td>0.4597</td><td>1513</td></tr><tr><td>2-component GMM posterior = 0.5</td><td>0.4374</td><td>2986</td></tr><tr><td>mu + 3 sigma (assumes Gaussian - rejected)</td><td>0.5264</td><td>95</td></tr></tbody></table><figure><img src="../outputs/figures/fig08_threshold_candidates.png"><figcaption>Fig 2.2 - Sorted scores with candidate thresholds, histogram, Q-Q plot</figcaption></figure><h3>Choice: robust modified z-score &gt; 3.5 → <strong>threshold 0.5293, 86 crops flagged (0.83 %)</strong></h3>
+<ol>
+<li><strong>A Gaussian μ + kσ rule is not supported by the data.</strong> The v3 scores have skewness 0.96,
+   excess kurtosis 0.98 and D'Agostino K² = 1,363 (p ≈ 0), and the Q-Q plot bends upward in the right
+   tail. Worse, μ and σ are estimated <em>including</em> the tail we are trying to find, so the outliers
+   inflate their own threshold. We keep μ + 3σ only as a cross-check.</li>
+<li><strong>The elbow and GMM boundaries sit inside the body of the distribution, not at a break.</strong> After
+   v3 removed the no-data mode, the score distribution is <strong>unimodal</strong>. A two-component GMM
+   therefore splits the single skewed bulk into two overlapping Gaussians, and its boundary falls
+   near the 71st percentile (2,986 crops). The Kneedle elbow of the <em>whole</em> sorted curve marks where
+   the curve leaves its straight middle section, at the start of the ordinary right skew of normal
+   terrain (1,513 crops). Neither boundary coincides with any change in the behaviour of the density.</li>
+<li><strong>The modified z-score is built for exactly this situation.</strong> Median and MAD have a 50 %
+   breakdown point, so however many outliers exist they cannot move the threshold. k = 3.5 is the
+   value recommended by Iglewicz &amp; Hoaglin (1993). If the bulk were Gaussian with this robust scale,
+   only about 2 of 10,422 normal crops would exceed it by chance (printed below).</li>
+<li><strong>Independent rules agree.</strong> The robust rule (86) and the classical μ + 3σ cross-check (95) land
+   within 10 % of each other. On the sorted-score plot both sit at the foot of the final steep rise
+   (the last ~100 points), where the curve turns from gradual to near-vertical. This is exactly
+   the behaviour an elbow method should key on, once the elbow is sought in the tail rather than
+   across the whole curve.</li>
+<li><strong>Sensitivity is reported, not tuned.</strong> The printout shows how the count moves for k = 3 … 5.
+   We keep the conventional k = 3.5 rather than choosing k to hit a count.</li>
+</ol><p class="answer">Final threshold = 0.5293 → 86 crops flagged</p><h3>Contamination parameter</h3><p>sklearn's <code>IsolationForest(contamination=...)</code> only changes the offset used by <code>predict()</code> to produce
+±1 labels. It has <strong>no effect on <code>score_samples()</code></strong>, which is all we use. We set
+<code>contamination="auto"</code> (sklearn's default, offset −0.5), and we never call <code>predict()</code>. The final
+anomaly count is determined solely by the statistical threshold on the continuous Novelty Score
+above, <strong>independently of any assumed contamination fraction</strong>.</p><h2>2.3 Image location analysis</h2><p>Each scored crop is joined to <code>source_image_metadata.csv</code> through its <code>source_image_id</code> (from
+<code>crop_metadata_index.csv</code>), many-to-one and validated. We then ask whether flags cluster in
+particular observations, latitudes, illumination conditions, seasons or resolutions.</p>
+<p><strong>Metadata resolution.</strong> The provided coordinates are quantised. Latitude is on a 5° grid from −45°
+to 60°, plus the two poles (±90°), and longitude takes only two values, 0° or 180°E (29 and 143
+sources). A longitude-latitude map would collapse to two vertical lines, so we analyse
+<strong>latitude bands × the two longitudes</strong> instead of point locations. We test
+per-source enrichment with a one-sided binomial test against the global flag rate
+(Bonferroni-corrected), and test trends with rank statistics (Spearman, Kruskal-Wallis), which
+make no Gaussian assumption.</p><figure><img src="../outputs/figures/fig10_location.png"><figcaption>Fig 2.3 - Location, illumination and season</figcaption></figure><table><thead><tr><th>test</th><th>value</th></tr></thead><tbody><tr><td>rho_sun</td><td>rho=-0.038, p=0.00012</td></tr><tr><td>rho_abslat</td><td>rho=0.032, p=0.0012</td></tr><tr><td>p_season</td><td>0.001644</td></tr><tr><td>p_resolution</td><td>1.055e-11</td></tr><tr><td>p_chi2_season</td><td>0.4758</td></tr><tr><td>n_src_flagged</td><td>39</td></tr><tr><td>n_src_enriched</td><td>4</td></tr></tbody></table><table><thead><tr><th>source_image_id</th><th>n</th><th>n_flag</th><th>rate</th><th>latitude</th><th>longitude</th><th>sun_angle</th><th>season</th><th>resolution</th><th>p_bonf</th></tr></thead><tbody><tr><td>SRC_039</td><td>16</td><td>13</td><td>0.8125</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td><td>0.0000</td></tr><tr><td>SRC_067</td><td>92</td><td>7</td><td>0.0761</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td><td>0.0021</td></tr><tr><td>SRC_166</td><td>16</td><td>6</td><td>0.3750</td><td>90.0000</td><td>0.0000</td><td>60.0942</td><td>N-spring</td><td>0.5000</td><td>0.0000</td></tr><tr><td>SRC_022</td><td>74</td><td>4</td><td>0.0541</td><td>20.0000</td><td>180.0000</td><td>41.5136</td><td>N-spring</td><td>0.2500</td><td>0.5798</td></tr><tr><td>SRC_094</td><td>63</td><td>4</td><td>0.0635</td><td>20.0000</td><td>180.0000</td><td>66.9345</td><td>N-autumn</td><td>0.2500</td><td>0.3224</td></tr><tr><td>SRC_140</td><td>62</td><td>4</td><td>0.0645</td><td>35.0000</td><td>180.0000</td><td>44.8556</td><td>N-spring</td><td>0.2500</td><td>0.3039</td></tr><tr><td>SRC_131</td><td>67</td><td>3</td><td>0.0448</td><td>10.0000</td><td>180.0000</td><td>60.5405</td><td>N-autumn</td><td>0.5000</td><td>1.0000</td></tr><tr><td>SRC_078</td><td>28</td><td>3</td><td>0.1071</td><td>15.0000</td><td>180.0000</td><td>40.4370</td><td>N-spring</td><td>0.2500</td><td>0.2713</td></tr><tr><td>SRC_032</td><td>14</td><td>3</td><td>0.2143</td><td>-5.0000</td><td>180.0000</td><td>52.4902</td><td>N-spring</td><td>0.2500</td><td>0.0329</td></tr><tr><td>SRC_083</td><td>28</td><td>3</td><td>0.1071</td><td>0.0000</td><td>180.0000</td><td>55.3789</td><td>N-spring</td><td>0.2500</td><td>0.2713</td></tr></tbody></table><p><strong>Findings.</strong></p>
+<ul>
+<li>Flags are spread over 39 of the 172 source observations, but <strong>4 sources are significantly
+  enriched</strong> (one-sided binomial test against the 0.83 % base rate, Bonferroni-corrected p &lt; 0.05).
+  The two strongest are both <strong>north-polar (90° N)</strong>: SRC_039 has <strong>13 of its 16 crops</strong> flagged and
+  SRC_166 has 6 of 16. Together they contribute 19 of the 86 flags. The other two are SRC_067
+  (7 of 92, 15° S) and SRC_032 (3 of 14, 5° S).</li>
+<li><strong>Physical reading: rare terrain, not tampering.</strong> North-polar crops show bright ice, finely banded
+  layered deposits and scarps. For example, the "stripes" of 08731 and 03423 are polar layering, not
+  sensor banding. This terrain is a small minority of the training crops, so its latents are easy
+  to isolate. A mission pipeline would <em>route</em> these flags to the polar science team rather than
+  discard them. The metadata is what tells us these flags are a terrain class, not artefacts.</li>
+<li><strong>Latitude.</strong> Between 45° S and 55° N the flag rate fluctuates around the base rate (0-1.5 %), then
+  jumps at 60° N (≈4.4 %) and 90° N (≈5 %). Correlation with |latitude| overall is negligible
+  (ρ = 0.03), so the effect is confined to the high northern bands.</li>
+<li><strong>Illumination.</strong> ρ(sun angle, novelty) = −0.04. It is statistically significant only because
+  n = 10,422; the effect size is negligible, and flagged crops span the whole 36-79° range.</li>
+<li><strong>Season.</strong> The score <em>distributions</em> differ slightly (Kruskal-Wallis p = 0.002), but <em>flagging</em>
+  is independent of season (χ² p = 0.48).</li>
+<li><strong>Resolution.</strong> Scores differ strongly by resolution (p ≈ 10⁻¹¹), consistent with the t-SNE
+  observation that pixel scale changes texture frequency. Yet the lone 1 m/px observation (SRC_111)
+  has only 2 of 137 crops flagged, so scale shifts the bulk of the distribution but does not by
+  itself produce flags.</li>
+</ul><h2>2.4 Metadata fusion (optional)</h2><p>We concatenate the standardised image latent with an encoded metadata vector: z-scored sun angle,
+sin/cos of latitude and longitude (to respect circularity), log₂ resolution, and a one-hot season.
+We re-score with the same Isolation Forest settings and the same modified-z rule, then compare the
+flagged sets. The image-only pipeline remains the primary result.</p><table><thead><tr><th>n_image</th><th>n_fused</th><th>overlap</th><th>jaccard</th><th>rank_corr</th></tr></thead><tbody><tr><td>86</td><td>93</td><td>83</td><td>0.8646</td><td>0.9921</td></tr></tbody></table><p>Fusion changes little: 93 crops are flagged against 86 image-only, with 83 in common (Jaccard 0.86)
+and a rank correlation of 0.992 between the two scorings. Fusion adds 10 crops and drops 3. Two
+reasons explain the small effect:</p>
+<ol>
+<li>The Isolation Forest picks split features uniformly at random, and only 10 of the 266 fused
+   dimensions are metadata, so metadata drives about 4 % of splits.</li>
+<li>Every crop from one observation shares identical metadata. Metadata can therefore isolate an
+   unusual <em>observation</em>, but never a single crop within it, whereas the injected anomalies are
+   single crops.</li>
+</ol>
+<p>Metadata is therefore most useful as we used it in 2.3, to <em>explain</em> flags after the fact (e.g. the
+polar enrichment), rather than as an input to detection.</p><h1>Phase 3 - Reconstruction Interpretability</h1><h2>3.1 Pixel-wise error heatmaps</h2><p>The five highest-scoring crops <strong>within the statistically thresholded set</strong> are passed back through
+the decoder. The per-pixel squared error (lightly smoothed, σ = 2 px) is shown alone and overlaid on
+the original. To make the physical reading less subjective, we also compute descriptors of each
+error map and image (<code>heatmap_descriptors</code>). Each descriptor is reported as a percentile against 500
+random un-flagged crops:</p>
+<ul>
+<li>error <strong>concentration</strong> (share of error in the top 5 % of pixels)</li>
+<li><strong>line score</strong> (a single-row or single-column error spike, as a seam would produce)</li>
+<li><strong>seam step</strong> (the largest mean-intensity jump across a straight line)</li>
+<li>spectral <strong>periodicity</strong> (stripes or banding)</li>
+<li><strong>saturation</strong> (clipped pixels)</li>
+</ul><figure><img src="../outputs/figures/fig11_heatmaps_top5.png"><figcaption>Fig 3.1 - Top-5 thresholded crops: original, reconstruction, error, overlay</figcaption></figure><table><thead><tr><th>rank</th><th>filename</th><th>source</th><th>novelty</th><th>recon_mse</th><th>concentration</th><th>line_score</th><th>seam_step</th><th>periodicity</th><th>saturation</th></tr></thead><tbody><tr><td>1</td><td>sample_00849.jpg</td><td>SRC_022</td><td>0.5868</td><td>0.0023</td><td>0.6608</td><td>73.9428</td><td>0.4180</td><td>0.7265</td><td>0.0058</td></tr><tr><td>2</td><td>sample_06917.jpg</td><td>SRC_122</td><td>0.5819</td><td>0.0029</td><td>0.2678</td><td>2.1512</td><td>0.1453</td><td>0.7671</td><td>0.0033</td></tr><tr><td>3</td><td>sample_05849.jpg</td><td>SRC_008</td><td>0.5801</td><td>0.0022</td><td>0.5052</td><td>5.8550</td><td>0.1455</td><td>0.7792</td><td>0.1110</td></tr><tr><td>4</td><td>sample_03423.jpg</td><td>SRC_128</td><td>0.5790</td><td>0.0010</td><td>0.7028</td><td>26.7748</td><td>0.3874</td><td>0.8574</td><td>0.0005</td></tr><tr><td>5</td><td>sample_03383.jpg</td><td>SRC_067</td><td>0.5773</td><td>0.0033</td><td>0.5301</td><td>4.7143</td><td>0.0703</td><td>0.4949</td><td>0.0195</td></tr></tbody></table><p>Percentile of each descriptor against 500 random normal crops:</p><table><thead><tr><th>filename</th><th>concentration</th><th>line_score</th><th>seam_step</th><th>periodicity</th><th>saturation</th><th>mean</th><th>std</th></tr></thead><tbody><tr><td>sample_00849.jpg</td><td>99</td><td>100</td><td>100</td><td>89</td><td>99</td><td>100</td><td>100</td></tr><tr><td>sample_06917.jpg</td><td>33</td><td>18</td><td>96</td><td>92</td><td>99</td><td>83</td><td>100</td></tr><tr><td>sample_05849.jpg</td><td>93</td><td>83</td><td>96</td><td>93</td><td>100</td><td>44</td><td>100</td></tr><tr><td>sample_03423.jpg</td><td>99</td><td>99</td><td>100</td><td>98</td><td>87</td><td>87</td><td>100</td></tr><tr><td>sample_03383.jpg</td><td>94</td><td>74</td><td>78</td><td>66</td><td>100</td><td>1</td><td>98</td></tr></tbody></table><figure><img src="../outputs/figures/fig11b_supplementary_heatmaps.png"><figcaption>Fig 3.1b - Decoder residual on visually noticed crops (flagged content anomalies vs missed local glitches)</figcaption></figure><h2>3.2 Geological report</h2><p>These are <strong>hypotheses</strong>, argued from the heatmap pattern, the descriptors (with percentiles against
+500 normal crops) and the metadata. They are not definitive classifications.</p>
+<p><strong>#1 sample_00849 (SRC_022, 20° N): straight albedo boundary. Hypothesis: spliced terrain or a
+mosaic seam.</strong> A bright slope with gullies is cut by a <em>straight</em>, full-height boundary to a uniformly
+darker band (seam step 0.42, the 100th percentile; the crop is also brighter than every reference crop).
+Natural albedo contacts on Mars follow topography and are rarely ruler-straight across a whole
+frame. A straight contact between two unrelated surfaces is the signature of <strong>semantic splicing</strong>,
+or, less exotically, of a seam between two HiRISE CCD channels with mismatched gain. The
+reconstruction error is low (the decoder draws both halves and the boundary), so the flag comes from
+the <em>rarity of the configuration</em> in latent space, not from a failure to encode it. The only
+concentrated error sits on the edge of the small filled no-data wedge at the left, so part of this
+crop's score may be the residual no-data effect noted in the changelog.</p>
+<p><strong>#2 sample_06917 (SRC_122, 5° S): fresh crater filling the frame. Hypothesis: genuine, rare geology.</strong>
+The error forms a <strong>ring that follows the crater rim</strong>, with streaks down the inner walls. Its
+concentration is low (33rd percentile), spread along the whole rim. A sharp-rimmed impact crater with
+gullied walls, a shadowed wall and a bright floor is a high-relief, high-frequency structure that a
+256-float global code can only sketch. Such large fresh craters are uncommon at this crop scale,
+where most crops are plains, dunes and knobby terrain. The pattern is physically coherent (the error
+sits exactly where relief is steepest) and does <em>not</em> resemble any of the injection signatures.</p>
+<p><strong>#3 sample_05849 (SRC_008, 25° N): crater or pit with a fully black shadow. Hypothesis: genuine
+steep-walled depression at the limit of the sensor's dynamic range.</strong> 11 % of the pixels are clipped
+at 0 (saturation at the 100th percentile). The error traces the <strong>rim and the sunlit wall</strong>, where
+the illuminated rock meets the clipped shadow. The shadow sits on the wall facing away from the sun,
+consistent with the illumination of the surrounding small craters, which argues for real topography
+rather than a synthetic black blob. An exposure set for the bright plain cannot record the shadowed
+interior, so it clips. This is either a very deep fresh crater or a collapse pit. It is rare, but
+Martian.</p>
+<p><strong>#4 sample_03423 (SRC_128, 90° N): polar layered terrain with a large filled no-data area.
+Hypothesis: genuine polar geology plus the residual no-data effect.</strong> The valid area is a rotated
+strip, with the two wedges masked and filled. It shows a bright, smooth upper surface and a darker
+lower surface separated by a curved scarp with fine parallel banding (periodicity at the 98th
+percentile). At 90° N this is the morphology of the <strong>north polar layered deposits</strong>, stacked ice and
+dust layers exposed on a scarp. The reconstruction error is the <em>lowest</em> of the top 5, so again the
+novelty is configurational: rare polar terrain, and an unusually large flat fill region, as
+discussed in the v3/v4 changelog.</p>
+<p><strong>#5 sample_03383 (SRC_067, 15° S): dark, low-sun rugged relief. Hypothesis: genuine massifs or
+ridges under oblique illumination.</strong> The frame is darker than 99 % of reference crops, and its
+contrast is at the 98th percentile. The error is concentrated on the <strong>thin sunlit crests</strong>, not in
+the shadows. Long shadows from steep spurs make a high-contrast, high-frequency pattern whose exact
+crest geometry the code cannot store. SRC_067 is one of the four significantly enriched sources
+(7 flags in 92 crops), which is what we would expect if the whole observation images unusual rugged
+terrain.</p>
+<p><strong>Beyond the top 5 (Fig 3.1b, diagnostic).</strong> The heatmap <em>pattern</em> separates the injected content
+from the rare geology above:</p>
+<ul>
+<li>The <strong>Pentagon</strong> aerial photograph (rank 47) and the <strong>periodic grid</strong> (rank 11), which on close
+  inspection resembles an orchard (rows of trees seen from above), have the two highest
+  reconstruction errors in the whole dataset (100th percentile). Their error is <strong>spread
+  diffusely over the entire frame</strong> (concentration 0.18 and 0.16, i.e. almost uniform). The decoder
+  has no Martian vocabulary for rectilinear buildings or a perfect lattice, so it fails everywhere.
+  This is the textbook <strong>non-Martian domain-shift</strong> signature.</li>
+<li>The <strong>black bar</strong> and <strong>two streaks</strong>, which are <em>not</em> flagged by the latent score (ranks 1,120 and
+  2,211), nevertheless sit in the <strong>top 1 % of reconstruction error</strong>, with the error lying <em>along the
+  straight dark defect</em> (line scores 4.6 and 5.4). This is the <strong>synthetic sensor-artefact</strong>
+  signature, and it shows the global latent's blind spot for small local defects (changelog, v3
+  and v4).</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>heatmap pattern</th>
+<th>examples</th>
+<th>physical hypothesis</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ring following a rim, error on steep walls</td>
+<td>06917, 05849</td>
+<td>real high-relief feature beyond the code's resolution (rare geology)</td>
+</tr>
+<tr>
+<td>error on thin bright crests of a dark frame</td>
+<td>03383</td>
+<td>oblique illumination of rugged relief</td>
+</tr>
+<tr>
+<td>low error, high novelty</td>
+<td>00849, 03423</td>
+<td>rare <em>configuration</em>: straight seam (splice / CCD seam) or polar terrain + large fill</td>
+</tr>
+<tr>
+<td>intense error spread over the whole frame</td>
+<td>Pentagon 09828, grid 06476</td>
+<td>domain shift: non-Martian content</td>
+</tr>
+<tr>
+<td>error along a straight dark line</td>
+<td>bar 00015, streaks 00503</td>
+<td>synthetic sensor artefact (missed by the latent)</td>
+</tr>
+</tbody>
+</table><h1>Phase 4 - Architecture Iteration & Design Journal</h1><table><thead><tr><th>version</th><th>val_mse</th><th>val_ssim</th><th>nodata_mse_ratio</th><th>pca90</th><th>corr_nov_nodata</th><th>n_flag_mad35</th><th>flagged_with_nodata</th></tr></thead><tbody><tr><td>v1</td><td>0.0019</td><td>0.7053</td><td>1.0011</td><td>44</td><td>0.6347</td><td>1596</td><td>0.9655</td></tr><tr><td>v2</td><td>0.0023</td><td>0.7065</td><td>1.0157</td><td>36</td><td>0.6571</td><td>1985</td><td>0.9597</td></tr><tr><td>v3</td><td>0.0021</td><td>0.7195</td><td>1.1564</td><td>190</td><td>0.1100</td><td>86</td><td>0.4767</td></tr><tr><td>v4</td><td>0.0022</td><td>0.7159</td><td>1.1597</td><td>139</td><td>0.0659</td><td>510</td><td>0.3353</td></tr></tbody></table><figure><img src="../outputs/figures/fig12_versions_hist.png"><figcaption>Fig 4.1 - Novelty Score distributions per version (orange = crops with no-data border)</figcaption></figure><figure><img src="../outputs/figures/fig13_versions_top8.png"><figcaption>Fig 4.2 - Highest-scoring crops per version</figcaption></figure><p>Rank of visually noticed spot-check crops in each version (diagnostic only, never used to set the threshold):</p><table><thead><tr><th>crop</th><th>note</th><th>v1 rank</th><th>v1 flagged</th><th>v2 rank</th><th>v2 flagged</th><th>v3 rank</th><th>v3 flagged</th><th>v4 rank</th><th>v4 flagged</th></tr></thead><tbody><tr><td>sample_00015.jpg</td><td>black bar</td><td>4499</td><td>False</td><td>3859</td><td>False</td><td>1120</td><td>False</td><td>2833</td><td>False</td></tr><tr><td>sample_00503.jpg</td><td>two streaks</td><td>7419</td><td>False</td><td>5171</td><td>False</td><td>2211</td><td>False</td><td>3158</td><td>False</td></tr><tr><td>sample_00676.jpg</td><td>dead-pixel blocks</td><td>1571</td><td>True</td><td>1915</td><td>True</td><td>304</td><td>False</td><td>872</td><td>False</td></tr><tr><td>sample_09828.jpg</td><td>Pentagon (terrestrial)</td><td>2875</td><td>False</td><td>2275</td><td>False</td><td>47</td><td>True</td><td>488</td><td>True</td></tr><tr><td>sample_05508.jpg</td><td>terrestrial buildings</td><td>2681</td><td>False</td><td>2494</td><td>False</td><td>354</td><td>False</td><td>512</td><td>False</td></tr><tr><td>sample_06476.jpg</td><td>periodic grid</td><td>10225</td><td>False</td><td>5839</td><td>False</td><td>11</td><td>True</td><td>178</td><td>True</td></tr><tr><td>sample_07971.jpg</td><td>periodic grid</td><td>7163</td><td>False</td><td>3281</td><td>False</td><td>21</td><td>True</td><td>815</td><td>False</td></tr><tr><td>sample_05395.jpg</td><td>bright + thin line</td><td>784</td><td>True</td><td>1735</td><td>True</td><td>12</td><td>True</td><td>743</td><td>False</td></tr><tr><td>sample_00011.jpg</td><td>dark terrain (control)</td><td>2157</td><td>False</td><td>1993</td><td>False</td><td>1297</td><td>False</td><td>368</td><td>True</td></tr><tr><td>sample_00385.jpg</td><td>dark terrain (control)</td><td>4448</td><td>False</td><td>2992</td><td>False</td><td>1451</td><td>False</td><td>1154</td><td>False</td></tr></tbody></table><p>Every version uses identical data (10,422 crops), a random 90/10 split held out for loss curves,
+AdamW + one-cycle LR (max 1e-3), batch 64, 30 epochs, horizontal/vertical flip augmentation,
+bf16 autocast, seed 42, and the same Isolation Forest (500 trees, ψ = 256, 5 seeds averaged).
+Each version changes <strong>one</strong> thing, so its effect can be attributed.</p>
+<hr />
+<h2>v1 - Baseline: convolutional AE, pure MSE</h2>
+<p><strong>Setup.</strong> 5× stride-2 conv encoder (32-64-128-256-256) → Linear → 256-d latent; mirrored
+transposed-conv decoder; loss = MSE.</p>
+<p><strong>Result.</strong> Held-out MSE 0.00189, SSIM 0.705 after 30 epochs (plateaued from epoch ~20).</p>
+<h3>Symptom 1 - Blurry reconstructions, fine texture erased</h3>
+<p>Dune ripple trains, small-crater fields and rough ground are reconstructed as smooth grey gradients
+(outputs/v1/recon_grid.png, random crops 07869 and 01503). The error maps of <em>normal</em> crops are
+dominated by texture, not by anything anomalous.</p>
+<h3>Symptom 2 - The novelty engine ranks map-projection borders, not anomalies</h3>
+<ul>
+<li>All of the top-25 Novelty Scores are crops with a black no-data wedge (the edge of the
+  map-projected HiRISE strip). Their error maps are just a bright line tracing the wedge edge.</li>
+<li>Spearman ρ(novelty, reconstruction MSE) = −0.095: what the forest isolates is unrelated to what
+  the decoder fails to explain.</li>
+<li>The score histogram has a long secondary shoulder (0.45-0.63) holding about 15 % of the crops, which
+  is roughly the share of crops with a border. Even the robust modified-z rule (median + 3.5 MAD) therefore
+  flags 1,596 crops (15.3 %), and the elbow and GMM rules flag even more. No defensible threshold can
+  exist while a nuisance factor forms its own mode.</li>
+<li>One latent coordinate has variance 2,800 against a median of 33, so the code spends its largest
+  axis on border geometry.</li>
+</ul>
+<h3>Diagnosis</h3>
+<ol>
+<li><strong>Blur:</strong> MSE is minimised by the conditional mean. When the exact phase of a ripple or
+   the rim of a small crater is uncertain, averaging the possibilities gives the lowest expected
+   squared error. The decoder learns to hedge, which erases exactly the high-frequency geology we
+   need in order to notice unfamiliar texture.</li>
+<li><strong>Borders:</strong> a no-data wedge is a 0-valued region with a razor-sharp straight edge at an
+   arbitrary angle and position. It is the highest-contrast structure in the dataset. Under MSE it
+   dominates the loss, so the encoder dedicates capacity to encoding wedge geometry. In the latent
+   space, crops with rare wedge angles are then the easiest points to isolate.</li>
+</ol>
+<h3>Fix</h3>
+<p>Addressed one at a time: v2 changes only the loss (symptom 1); v3 addresses the no-data
+nuisance (symptom 2).</p>
+<hr />
+<h2>v2 - Structural loss: 0.84·(1 − SSIM) + 0.16·L1 + 0.1·Gradient-L1</h2>
+<p><strong>Change (loss only; architecture, data and schedule identical to v1).</strong></p>
+<ul>
+<li><strong>SSIM</strong> (11×11 Gaussian window) penalises lost local contrast and structure even when mean
+  brightness is right, which directly targets blur. The 0.84 / 0.16 split follows Zhao et al. (2017,
+  <em>Loss Functions for Image Restoration with Neural Networks</em>).</li>
+<li><strong>L1</strong> replaces MSE as the intensity anchor. SSIM ignores uniform offsets, and L1 is less dominated
+  by a few huge errors than MSE.</li>
+<li><strong>Gradient-L1</strong> on finite differences penalises smeared ridgelines and crater rims.</li>
+</ul>
+<p><strong>Outcome.</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>v1</th>
+<th>v2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>held-out SSIM</td>
+<td>0.7053</td>
+<td>0.7065</td>
+</tr>
+<tr>
+<td>held-out MSE</td>
+<td>0.00189</td>
+<td>0.00228</td>
+</tr>
+<tr>
+<td>PCA components for 90 % latent variance</td>
+<td>44</td>
+<td>36</td>
+</tr>
+<tr>
+<td>Spearman ρ(novelty, no-data fraction)</td>
+<td>0.63</td>
+<td><strong>0.66</strong></td>
+</tr>
+<tr>
+<td>crops flagged by modified-z &gt; 3.5</td>
+<td>1,596</td>
+<td>1,985</td>
+</tr>
+</tbody>
+</table>
+<h3>Symptom 1 (blur) - essentially unchanged</h3>
+<p>Crater rims are slightly crisper, but dune ripples (crop 01503) and small-crater fields are still
+reconstructed as smooth gradients, and held-out SSIM moved by only +0.001.</p>
+<p><strong>Diagnosis.</strong> The loss was not the binding constraint. The code has only 256 floats for 51,529
+pixels (≈200× compression), squeezed through a single linear layer from an 8×8×256 map. The exact
+phase of a ripple field is high-entropy information that such a code cannot store. Whatever the
+loss, the decoder can only output the "texture class" with its details averaged out. <strong>Lesson:</strong>
+the loss decides <em>how</em> the unavoidable error is distributed; it cannot create information the
+bottleneck discarded. For anomaly detection this matters less than it first seemed. The latent
+only has to encode <em>what kind of</em> terrain a crop is, which it can do without reproducing every
+ripple.</p>
+<h3>Symptom 2 (no-data borders) - got worse</h3>
+<p>The novelty histogram (outputs/v2/scores.png) is now clearly <strong>bimodal</strong>. The second mode
+(0.47-0.60) is almost entirely crops with a black no-data wedge. ρ(novelty, no-data fraction), already
+0.63 under v1, rose to 0.66. The number flagged grew from 1,596 to 1,985, and every crop in the
+top 25 has a wedge.</p>
+<p><strong>Diagnosis.</strong> Both new loss terms are <em>edge-sensitive</em>. The wedge boundary is a 0 → bright step,
+the strongest gradient in the dataset, so SSIM and gradient-L1 reward the network for placing it
+exactly. The encoder therefore spends <em>more</em> of its (already scarce) capacity on wedge angle and
+position (the latent spectrum became more concentrated, 44 → 36 PCA components). In latent space,
+crops with unusual wedge geometry are the easiest to isolate. The wedge is an artefact of
+map-projecting the HiRISE strip, not terrain, so every one of those flags is a false positive by
+construction.</p>
+<h3>Fix → v3</h3>
+<p>Stop showing the network the wedge. Detect no-data regions, fill them with the crop's median, and
+exclude them from the loss and error maps, keeping the v2 loss.</p>
+<hr />
+<h2>v3 - No-data masking (data/loss change; architecture and loss weights as v2)</h2>
+<p><strong>Change.</strong> A no-data mask per crop marks near-black (≤ 5) regions that survive a 5×5 opening,
+touch the crop border and cover at least 0.5 % of it, dilated by 2 px for JPEG ringing. The opening
+matters: thin interior dark lines, which could themselves be sensor-glitch anomalies, are
+deliberately <strong>not</strong> masked (outputs/nodata_check.png). Masked pixels are filled with the crop's
+valid-pixel median and excluded from every loss term, metric and error map. 19.7 % of crops have a
+mask, covering 18.8 % of those crops on average.</p>
+<p><strong>Outcome.</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>v2</th>
+<th>v3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>held-out SSIM (v3: valid pixels)</td>
+<td>0.7065</td>
+<td>0.7195</td>
+</tr>
+<tr>
+<td>Spearman ρ(novelty, no-data fraction)</td>
+<td>0.66</td>
+<td><strong>0.11</strong></td>
+</tr>
+<tr>
+<td>Spearman ρ(novelty, reconstruction error)</td>
+<td>0.08</td>
+<td><strong>0.44</strong></td>
+</tr>
+<tr>
+<td>PCA components for 90 % latent variance</td>
+<td>36</td>
+<td><strong>190</strong></td>
+</tr>
+<tr>
+<td>score distribution</td>
+<td>bimodal</td>
+<td>unimodal, right-skewed tail</td>
+</tr>
+<tr>
+<td>flagged by modified-z &gt; 3.5</td>
+<td>1,985 (19 %)</td>
+<td><strong>86 (0.83 %)</strong></td>
+</tr>
+<tr>
+<td>μ + 3σ (cross-check)</td>
+<td>45</td>
+<td>95</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>The nuisance mode is gone. With no second mode, the robust modified-z rule and μ + 3σ now roughly
+  agree (86 vs 95 flagged), which suggests the tail is real rather than an artefact of the rule.</li>
+<li>Novelty now correlates with what the decoder fails to explain (ρ 0.08 → 0.44), and the code uses
+  far more of its dimensions (190 components for 90 % variance instead of 36).</li>
+<li>The flagged set now contains clear content anomalies: an <strong>aerial photograph of the Pentagon</strong>
+  (crop 09828), two <strong>perfectly periodic grid textures</strong> (06476, 07971) and striped strips (08731,
+  06424) (outputs/v3_flagged_grid.png). Under v1 and v2 these were buried beneath the border crops:</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>spot-check crop</th>
+<th>v1 rank</th>
+<th>v2 rank</th>
+<th>v3 rank</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>06476 periodic grid</td>
+<td>10,225</td>
+<td>5,839</td>
+<td><strong>11</strong></td>
+</tr>
+<tr>
+<td>07971 periodic grid</td>
+<td>7,163</td>
+<td>3,281</td>
+<td><strong>21</strong></td>
+</tr>
+<tr>
+<td>09828 Pentagon (terrestrial)</td>
+<td>2,875</td>
+<td>2,275</td>
+<td><strong>47</strong></td>
+</tr>
+<tr>
+<td>05395 bright terrain + thin dark line</td>
+<td>784</td>
+<td>1,735</td>
+<td><strong>12</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>Symptom - small local glitches are ranked far below the threshold</h3>
+<p>During the sanity pass we noticed crops with obvious synthetic defects: a thick black bar
+(00015), two black streaks (00503) and square dead-pixel blocks (00676). These are qualitative
+spot checks we saw by eye; we used them only to diagnose, never to tune the threshold. v3 ranks them
+1,120th, 2,211th and 304th, far below the 86 flagged, even though their <em>reconstruction error</em> is
+visibly concentrated on the defect. A secondary residual: 41 of the 86 flagged crops still have a
+(filled) wedge, against a 20 % base rate. A large perfectly flat region is itself uncommon.</p>
+<h3>Diagnosis</h3>
+<p>The bottleneck is one <strong>global</strong> linear layer from the whole 8×8×256 feature map to 256 numbers,
+and that layer is trained to summarise normal terrain. A defect covering about 2 % of the pixels
+barely moves this global summary: the encoder projects the crop onto the normal-terrain manifold
+and "forgets" the bar. The decoder then reproduces clean terrain, which is why the defect shows up
+in the residual but not in the latent. Latent-density detection with a global code is sensitive to
+<em>scene-level</em> novelty (Earth imagery, alien textures) and blind to <em>local</em> defects (glitches,
+splice seams).</p>
+<h3>Fix → v4</h3>
+<p>Keep the information local. Replace the global linear bottleneck with a <strong>spatial bottleneck</strong>,
+a 1×1 convolution to an 8×8 grid of 4 channels, flattened to the same 256-d 1-D vector. Each
+coordinate then describes one ~63 px neighbourhood, so a local defect drives a few coordinates to
+extreme values, which is exactly what an Isolation Forest's axis-aligned random splits isolate fastest.</p>
+<hr />
+<h2>v4 - Spatial bottleneck (architecture change; loss and masking as v3) - REJECTED</h2>
+<p><strong>Change.</strong> The encoder's 8×8×256 map is reduced by a 1×1 convolution to 8×8×4 and flattened to a
+256-d 1-D latent. The latent size, compression ratio, loss, masking and schedule are all as in v3.
+Dropping the two 16,384×256 linear layers cuts the model from 11.1 M to 2.7 M parameters.</p>
+<p><strong>Outcome - the hypothesis failed.</strong></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>v3</th>
+<th>v4</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>held-out SSIM (valid pixels)</td>
+<td>0.7195</td>
+<td>0.7159</td>
+</tr>
+<tr>
+<td>flagged by modified-z &gt; 3.5</td>
+<td>86</td>
+<td>510</td>
+</tr>
+<tr>
+<td>Spearman ρ(novelty, reconstruction error)</td>
+<td>0.44</td>
+<td>0.22</td>
+</tr>
+<tr>
+<td>Spearman ρ(novelty, deviation from typical brightness)</td>
+<td>0.36</td>
+<td><strong>0.66</strong></td>
+</tr>
+<tr>
+<td>share of flagged crops among the 5 % darkest + 5 % brightest</td>
+<td>58 %</td>
+<td><strong>97 %</strong></td>
+</tr>
+<tr>
+<td>rank of black bar / two streaks / dead-pixel blocks</td>
+<td>1,120 / 2,211 / 304</td>
+<td>2,833 / 3,158 / 872</td>
+</tr>
+<tr>
+<td>rank of Pentagon / periodic grids</td>
+<td>47 / 11, 21</td>
+<td>488 / 178, 815</td>
+</tr>
+</tbody>
+</table>
+<h3>Symptom</h3>
+<p>The local glitches did <strong>not</strong> move up; they moved <em>down</em>. The content anomalies that v3 caught
+(the Pentagon, the periodic grids) were pushed out of the flagged set, and the flagged set grew
+six-fold. It is now almost entirely very dark or very bright scenes
+(outputs/v4_flagged_grid.png), which is exactly the "brightness heuristic" failure the organisers
+warned about.</p>
+<h3>Diagnosis</h3>
+<p>With only 4 channels per cell and no mixing across cells, each coordinate becomes a <em>local
+albedo / local gradient</em> descriptor. An Isolation Forest isolates points that are extreme along
+individual coordinates, and in a code made of local-albedo features the most extreme crops are simply
+the darkest and brightest scenes. The injected defects are anomalous in their <strong>configuration</strong> (a
+perfectly straight dark bar, square blocks, a regular grid), not in their local brightness. At the
+scale of a 63 px cell, a black bar is about as dark as an ordinary shadow, so none of its coordinates
+is extreme. The global code of v3 can represent "this scene contains an unnatural structure",
+because its linear layer combines evidence across the whole crop. The per-cell code cannot.</p>
+<h3>Decision</h3>
+<p><strong>Revert to v3 as the final model.</strong> v4 stays in the journal as a documented negative result. The
+choice is made on label-free evidence: v3's novelty agrees better with what the decoder fails to
+explain (ρ 0.44 vs 0.22), it depends much less on raw brightness, and its score distribution gives
+a small tail on which the robust and Gaussian rules agree (86 vs 95). The spot checks only
+corroborate this.</p>
+<p><strong>Remaining limitation (honest).</strong> Recall is incomplete. A second Earth image (an aerial view of
+buildings, crop 05508, spotted in v4's grid) ranks 354th under v3 and is not flagged. Small
+local defects are still missed by <em>latent-space</em> scoring in every version. The decoder residual
+catches two of the three: the black bar and the two streaks are in the <strong>top 1 % of reconstruction
+error</strong>, with their error lying along the defect (Fig 3.1b). The dead-pixel blocks are invisible even
+there (53rd percentile). Residual-based or patch-level scoring is therefore a promising extension,
+but not a complete answer. v3 also keeps some brightness bias:
+58 % of its flags lie in the brightness extremes, against a 10 % base rate. Some of that is
+genuine, because unusually bright or dark terrain (frost, deep shadow) <em>is</em> rarer.</p>
+<hr /><h1>Appendix - all flagged crops</h1><table><thead><tr><th>filename</th><th>source_image_id</th><th>novelty</th><th>recon_mse</th><th>latitude</th><th>longitude</th><th>sun_angle</th><th>season</th><th>resolution</th></tr></thead><tbody><tr><td>sample_00849.jpg</td><td>SRC_022</td><td>0.5868</td><td>0.0022</td><td>20.0000</td><td>180.0000</td><td>41.5136</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_06917.jpg</td><td>SRC_122</td><td>0.5819</td><td>0.0029</td><td>-5.0000</td><td>180.0000</td><td>57.3105</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_05849.jpg</td><td>SRC_008</td><td>0.5801</td><td>0.0022</td><td>25.0000</td><td>180.0000</td><td>61.0059</td><td>N-autumn</td><td>0.2500</td></tr><tr><td>sample_03423.jpg</td><td>SRC_128</td><td>0.5789</td><td>0.0010</td><td>90.0000</td><td>0.0000</td><td>56.6348</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_03383.jpg</td><td>SRC_067</td><td>0.5773</td><td>0.0033</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_01380.jpg</td><td>SRC_039</td><td>0.5758</td><td>0.0043</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_04113.jpg</td><td>SRC_164</td><td>0.5741</td><td>0.0027</td><td>20.0000</td><td>180.0000</td><td>59.2269</td><td>N-autumn</td><td>0.2500</td></tr><tr><td>sample_08713.jpg</td><td>SRC_032</td><td>0.5730</td><td>0.0019</td><td>-5.0000</td><td>180.0000</td><td>52.4902</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_06963.jpg</td><td>SRC_166</td><td>0.5716</td><td>0.0051</td><td>90.0000</td><td>0.0000</td><td>60.0942</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_05326.jpg</td><td>SRC_131</td><td>0.5700</td><td>0.0010</td><td>10.0000</td><td>180.0000</td><td>60.5405</td><td>N-autumn</td><td>0.5000</td></tr><tr><td>sample_06476.jpg</td><td>SRC_158</td><td>0.5665</td><td>0.0295</td><td>-5.0000</td><td>180.0000</td><td>35.9541</td><td>N-winter</td><td>0.2500</td></tr><tr><td>sample_05395.jpg</td><td>SRC_024</td><td>0.5664</td><td>0.0067</td><td>10.0000</td><td>180.0000</td><td>53.7258</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_05994.jpg</td><td>SRC_072</td><td>0.5661</td><td>0.0029</td><td>15.0000</td><td>180.0000</td><td>46.9668</td><td>N-winter</td><td>0.2500</td></tr><tr><td>sample_08731.jpg</td><td>SRC_039</td><td>0.5660</td><td>0.0027</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_02344.jpg</td><td>SRC_083</td><td>0.5660</td><td>0.0020</td><td>0.0000</td><td>180.0000</td><td>55.3789</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_02790.jpg</td><td>SRC_101</td><td>0.5643</td><td>0.0044</td><td>5.0000</td><td>180.0000</td><td>48.4794</td><td>N-winter</td><td>0.2500</td></tr><tr><td>sample_00307.jpg</td><td>SRC_047</td><td>0.5632</td><td>0.0015</td><td>0.0000</td><td>180.0000</td><td>48.0287</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_01094.jpg</td><td>SRC_111</td><td>0.5627</td><td>0.0026</td><td>-35.0000</td><td>180.0000</td><td>79.0699</td><td>N-spring</td><td>1.0000</td></tr><tr><td>sample_09453.jpg</td><td>SRC_032</td><td>0.5625</td><td>0.0040</td><td>-5.0000</td><td>180.0000</td><td>52.4902</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_07744.jpg</td><td>SRC_078</td><td>0.5597</td><td>0.0020</td><td>15.0000</td><td>180.0000</td><td>40.4370</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_07971.jpg</td><td>SRC_078</td><td>0.5589</td><td>0.0157</td><td>15.0000</td><td>180.0000</td><td>40.4370</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_04696.jpg</td><td>SRC_039</td><td>0.5586</td><td>0.0042</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_02718.jpg</td><td>SRC_123</td><td>0.5578</td><td>0.0054</td><td>0.0000</td><td>180.0000</td><td>54.5981</td><td>N-autumn</td><td>0.5000</td></tr><tr><td>sample_08621.jpg</td><td>SRC_039</td><td>0.5568</td><td>0.0048</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_05036.jpg</td><td>SRC_104</td><td>0.5557</td><td>0.0022</td><td>25.0000</td><td>180.0000</td><td>45.1020</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_06424.jpg</td><td>SRC_039</td><td>0.5545</td><td>0.0033</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_07875.jpg</td><td>SRC_140</td><td>0.5541</td><td>0.0014</td><td>35.0000</td><td>180.0000</td><td>44.8556</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_07170.jpg</td><td>SRC_039</td><td>0.5541</td><td>0.0048</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_04017.jpg</td><td>SRC_083</td><td>0.5529</td><td>0.0019</td><td>0.0000</td><td>180.0000</td><td>55.3789</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_00606.jpg</td><td>SRC_083</td><td>0.5526</td><td>0.0014</td><td>0.0000</td><td>180.0000</td><td>55.3789</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_08200.jpg</td><td>SRC_140</td><td>0.5526</td><td>0.0014</td><td>35.0000</td><td>180.0000</td><td>44.8556</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_09543.jpg</td><td>SRC_094</td><td>0.5519</td><td>0.0016</td><td>20.0000</td><td>180.0000</td><td>66.9345</td><td>N-autumn</td><td>0.2500</td></tr><tr><td>sample_09777.jpg</td><td>SRC_070</td><td>0.5516</td><td>0.0021</td><td>60.0000</td><td>180.0000</td><td>58.7890</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_03118.jpg</td><td>SRC_155</td><td>0.5510</td><td>0.0071</td><td>-5.0000</td><td>180.0000</td><td>59.1175</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_03708.jpg</td><td>SRC_039</td><td>0.5510</td><td>0.0040</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_07663.jpg</td><td>SRC_039</td><td>0.5510</td><td>0.0043</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_02760.jpg</td><td>SRC_052</td><td>0.5499</td><td>0.0050</td><td>5.0000</td><td>180.0000</td><td>51.7054</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_05733.jpg</td><td>SRC_039</td><td>0.5497</td><td>0.0040</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_03718.jpg</td><td>SRC_022</td><td>0.5490</td><td>0.0016</td><td>20.0000</td><td>180.0000</td><td>41.5136</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_09357.jpg</td><td>SRC_072</td><td>0.5489</td><td>0.0014</td><td>15.0000</td><td>180.0000</td><td>46.9668</td><td>N-winter</td><td>0.2500</td></tr><tr><td>sample_09067.jpg</td><td>SRC_039</td><td>0.5489</td><td>0.0041</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_04629.jpg</td><td>SRC_039</td><td>0.5482</td><td>0.0049</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_08138.jpg</td><td>SRC_028</td><td>0.5467</td><td>0.0012</td><td>10.0000</td><td>180.0000</td><td>42.8948</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_06777.jpg</td><td>SRC_114</td><td>0.5463</td><td>0.0017</td><td>-10.0000</td><td>180.0000</td><td>58.1765</td><td>N-autumn</td><td>0.5000</td></tr><tr><td>sample_01653.jpg</td><td>SRC_067</td><td>0.5460</td><td>0.0030</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_07428.jpg</td><td>SRC_166</td><td>0.5457</td><td>0.0033</td><td>90.0000</td><td>0.0000</td><td>60.0942</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_09828.jpg</td><td>SRC_156</td><td>0.5448</td><td>0.0210</td><td>10.0000</td><td>180.0000</td><td>48.7374</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_09498.jpg</td><td>SRC_067</td><td>0.5434</td><td>0.0033</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_04516.jpg</td><td>SRC_067</td><td>0.5430</td><td>0.0019</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_05582.jpg</td><td>SRC_166</td><td>0.5426</td><td>0.0046</td><td>90.0000</td><td>0.0000</td><td>60.0942</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_06820.jpg</td><td>SRC_106</td><td>0.5424</td><td>0.0028</td><td>25.0000</td><td>180.0000</td><td>40.6390</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_10319.jpg</td><td>SRC_094</td><td>0.5420</td><td>0.0015</td><td>20.0000</td><td>180.0000</td><td>66.9345</td><td>N-autumn</td><td>0.2500</td></tr><tr><td>sample_08392.jpg</td><td>SRC_070</td><td>0.5416</td><td>0.0022</td><td>60.0000</td><td>180.0000</td><td>58.7890</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_06428.jpg</td><td>SRC_039</td><td>0.5416</td><td>0.0055</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_08001.jpg</td><td>SRC_139</td><td>0.5414</td><td>0.0035</td><td>40.0000</td><td>180.0000</td><td>53.5333</td><td>N-winter</td><td>0.2500</td></tr><tr><td>sample_07701.jpg</td><td>SRC_136</td><td>0.5412</td><td>0.0170</td><td>-35.0000</td><td>180.0000</td><td>76.9224</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_06351.jpg</td><td>SRC_106</td><td>0.5412</td><td>0.0021</td><td>25.0000</td><td>180.0000</td><td>40.6390</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_01724.jpg</td><td>SRC_140</td><td>0.5410</td><td>0.0021</td><td>35.0000</td><td>180.0000</td><td>44.8556</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_03918.jpg</td><td>SRC_108</td><td>0.5407</td><td>0.0025</td><td>-40.0000</td><td>180.0000</td><td>68.8563</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_05584.jpg</td><td>SRC_039</td><td>0.5407</td><td>0.0049</td><td>90.0000</td><td>0.0000</td><td>70.6328</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_09975.jpg</td><td>SRC_067</td><td>0.5393</td><td>0.0009</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_00473.jpg</td><td>SRC_067</td><td>0.5390</td><td>0.0016</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_05368.jpg</td><td>SRC_140</td><td>0.5389</td><td>0.0015</td><td>35.0000</td><td>180.0000</td><td>44.8556</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_06335.jpg</td><td>SRC_052</td><td>0.5386</td><td>0.0010</td><td>5.0000</td><td>180.0000</td><td>51.7054</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_04902.jpg</td><td>SRC_123</td><td>0.5386</td><td>0.0060</td><td>0.0000</td><td>180.0000</td><td>54.5981</td><td>N-autumn</td><td>0.5000</td></tr><tr><td>sample_05284.jpg</td><td>SRC_166</td><td>0.5385</td><td>0.0034</td><td>90.0000</td><td>0.0000</td><td>60.0942</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_01216.jpg</td><td>SRC_078</td><td>0.5382</td><td>0.0027</td><td>15.0000</td><td>180.0000</td><td>40.4370</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_10097.jpg</td><td>SRC_022</td><td>0.5374</td><td>0.0008</td><td>20.0000</td><td>180.0000</td><td>41.5136</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_06196.jpg</td><td>SRC_103</td><td>0.5372</td><td>0.0037</td><td>-35.0000</td><td>180.0000</td><td>57.0904</td><td>N-autumn</td><td>0.2500</td></tr><tr><td>sample_07084.jpg</td><td>SRC_168</td><td>0.5367</td><td>0.0017</td><td>90.0000</td><td>0.0000</td><td>64.7096</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_06410.jpg</td><td>SRC_074</td><td>0.5358</td><td>0.0029</td><td>0.0000</td><td>180.0000</td><td>50.2546</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_00413.jpg</td><td>SRC_050</td><td>0.5342</td><td>0.0017</td><td>0.0000</td><td>180.0000</td><td>53.6801</td><td>N-summer</td><td>0.2500</td></tr><tr><td>sample_06220.jpg</td><td>SRC_166</td><td>0.5341</td><td>0.0015</td><td>90.0000</td><td>0.0000</td><td>60.0942</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_07299.jpg</td><td>SRC_094</td><td>0.5341</td><td>0.0030</td><td>20.0000</td><td>180.0000</td><td>66.9345</td><td>N-autumn</td><td>0.2500</td></tr><tr><td>sample_03147.jpg</td><td>SRC_058</td><td>0.5339</td><td>0.0009</td><td>30.0000</td><td>180.0000</td><td>69.0609</td><td>N-autumn</td><td>0.5000</td></tr><tr><td>sample_10203.jpg</td><td>SRC_166</td><td>0.5332</td><td>0.0032</td><td>90.0000</td><td>0.0000</td><td>60.0942</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_03515.jpg</td><td>SRC_131</td><td>0.5330</td><td>0.0011</td><td>10.0000</td><td>180.0000</td><td>60.5405</td><td>N-autumn</td><td>0.5000</td></tr><tr><td>sample_05004.jpg</td><td>SRC_091</td><td>0.5324</td><td>0.0031</td><td>-40.0000</td><td>180.0000</td><td>72.5113</td><td>N-summer</td><td>0.5000</td></tr><tr><td>sample_00824.jpg</td><td>SRC_067</td><td>0.5323</td><td>0.0012</td><td>-15.0000</td><td>180.0000</td><td>64.7242</td><td>N-spring</td><td>0.5000</td></tr><tr><td>sample_08152.jpg</td><td>SRC_131</td><td>0.5312</td><td>0.0004</td><td>10.0000</td><td>180.0000</td><td>60.5405</td><td>N-autumn</td><td>0.5000</td></tr><tr><td>sample_01916.jpg</td><td>SRC_139</td><td>0.5311</td><td>0.0034</td><td>40.0000</td><td>180.0000</td><td>53.5333</td><td>N-winter</td><td>0.2500</td></tr><tr><td>sample_06380.jpg</td><td>SRC_111</td><td>0.5304</td><td>0.0040</td><td>-35.0000</td><td>180.0000</td><td>79.0699</td><td>N-spring</td><td>1.0000</td></tr><tr><td>sample_04060.jpg</td><td>SRC_032</td><td>0.5303</td><td>0.0010</td><td>-5.0000</td><td>180.0000</td><td>52.4902</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_05800.jpg</td><td>SRC_023</td><td>0.5297</td><td>0.0085</td><td>-10.0000</td><td>180.0000</td><td>50.8374</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_10092.jpg</td><td>SRC_022</td><td>0.5295</td><td>0.0009</td><td>20.0000</td><td>180.0000</td><td>41.5136</td><td>N-spring</td><td>0.2500</td></tr><tr><td>sample_02823.jpg</td><td>SRC_094</td><td>0.5295</td><td>0.0008</td><td>20.0000</td><td>180.0000</td><td>66.9345</td><td>N-autumn</td><td>0.2500</td></tr></tbody></table></body></html>

@@ -1,0 +1,37 @@
+version,crop,note,rank,flagged
+v1,00015,black bar,4499,False
+v1,00503,two streaks,7419,False
+v1,00676,dead-pixel blocks,1571,True
+v1,09828,Pentagon (terrestrial),2875,False
+v1,06476,periodic grid,10225,False
+v1,07971,periodic grid,7163,False
+v1,05395,bright + thin line,784,True
+v1,00011,dark terrain (control),2157,False
+v1,00385,dark terrain (control),4448,False
+v2,00015,black bar,3859,False
+v2,00503,two streaks,5171,False
+v2,00676,dead-pixel blocks,1915,True
+v2,09828,Pentagon (terrestrial),2275,False
+v2,06476,periodic grid,5839,False
+v2,07971,periodic grid,3281,False
+v2,05395,bright + thin line,1735,True
+v2,00011,dark terrain (control),1993,False
+v2,00385,dark terrain (control),2992,False
+v3,00015,black bar,1120,False
+v3,00503,two streaks,2211,False
+v3,00676,dead-pixel blocks,304,False
+v3,09828,Pentagon (terrestrial),47,True
+v3,06476,periodic grid,11,True
+v3,07971,periodic grid,21,True
+v3,05395,bright + thin line,12,True
+v3,00011,dark terrain (control),1297,False
+v3,00385,dark terrain (control),1451,False
+v4,00015,black bar,2833,False
+v4,00503,two streaks,3158,False
+v4,00676,dead-pixel blocks,872,False
+v4,09828,Pentagon (terrestrial),488,True
+v4,06476,periodic grid,178,True
+v4,07971,periodic grid,815,False
+v4,05395,bright + thin line,743,False
+v4,00011,dark terrain (control),368,True
+v4,00385,dark terrain (control),1154,False

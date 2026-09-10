@@ -1,0 +1,17 @@
+{
+ "model": {
+  "latent_dim": 64,
+  "up": "transpose",
+  "res_blocks": 0,
+  "variational": false
+ },
+ "loss": {
+  "w_mse": 0.0,
+  "w_l1": 0.16,
+  "w_ssim": 0.84,
+  "w_grad": 0.1
+ },
+ "epochs": 12,
+ "lr": 0.001,
+ "nodata": true
+}

@@ -1,0 +1,12 @@
+{
+ "version": "sweep_64",
+ "latent_dim": 64,
+ "epochs": 12,
+ "val_mse": 0.002691703150048852,
+ "val_ssim": 0.6821656823158264,
+ "pca90": 30,
+ "tail_ratio": 10.886941573415502,
+ "n_flag_mad35": 868,
+ "corr_nov_nodata": 0.033948191646479595,
+ "flagged_with_nodata": 0.34101382488479265
+}

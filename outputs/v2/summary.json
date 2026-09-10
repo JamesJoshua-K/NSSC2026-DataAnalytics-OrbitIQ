@@ -1,0 +1,12 @@
+{
+ "version": "v2",
+ "latent_dim": 256,
+ "epochs": 30,
+ "val_mse": 0.002282851373791926,
+ "val_ssim": 0.7064505401362384,
+ "pca90": 36,
+ "tail_ratio": 14.65842665225297,
+ "n_flag_mad35": 1985,
+ "corr_nov_nodata": 0.6570878088090836,
+ "flagged_with_nodata": 0.9596977329974811
+}
