@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 V = sys.argv[1]
 X = np.load("cache/images_u8.npy")
-nd = np.load("cache/nodata_frac.npy")
+nd = (X <= 2).mean((1, 2))
 SPOT = {15: "black bar", 503: "two streaks", 676: "dead-pixel blocks", 9828: "Pentagon (terrestrial)",
         5508: "terrestrial buildings", 6476: "periodic grid", 7971: "periodic grid", 5395: "bright + thin line",
         11: "dark terrain (control)", 385: "dark terrain (control)"}

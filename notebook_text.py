@@ -8,19 +8,19 @@ T["title"] = r"""
 
 **Team:** OrbitIQ · National Students' Space Challenge, IIT Kharagpur
 
-**Pipeline:** custom convolutional autoencoder (trained from scratch, no pretrained weights) →
+**Pipeline:** custom two-stage convolutional autoencoder (trained from scratch, no pretrained weights) →
 1-D latent vector per crop → Isolation Forest Novelty Score (higher = more anomalous) →
 statistically justified threshold → metadata join → pixel-wise reconstruction-error heatmaps →
-physical hypotheses. Four model versions (v1 → v4) are trained and compared; the changelog
+physical hypotheses. Six model versions (v1 → v6) are trained and compared; the changelog
 (Phase 4 and `CHANGELOG.md`) documents each symptom → diagnosis → fix step.
 
 | Section | Content |
 |---|---|
 | 0 | Setup, data loading, sanity pass, no-data masking |
-| 1.1 / 1.2 / 1.3 | Architecture, loss design, training of v1-v4, t-SNE of latents |
+| 1.1 / 1.2 / 1.3 | Architecture, loss design, training of v1-v6, t-SNE of latents |
 | 2.1 / 2.2 / 2.3 / 2.4 | Isolation Forest scoring, statistical threshold, location analysis, metadata fusion |
 | 3.1 / 3.2 | Top-5 error heatmaps and geological report |
-| 4 | Iteration journal (v1 → v2 → v3 → v4) |
+| 4 | Iteration journal (v1 → v6) and planted-fakes benchmark |
 
 Reproduce: place `images.zip` (extracted to `data/images_unz/images/`), `crop_metadata_index.csv` and
 `source_image_metadata.csv` in `data/`, then run all cells. With `RETRAIN=False` the notebook loads
@@ -64,7 +64,7 @@ no transfer learning).
   227 → 114 → 57 → 29 → 15 → 8. Five halvings are the minimum that brings the map to 8×8, so the
   deepest units have a receptive field covering a large part of the crop (whole craters, dune trains)
   before the bottleneck.
-* **Bottleneck (final model, v3):** flatten (256×8×8 = 16,384) → `Linear` → **fixed-length 1-D
+* **Stage-1 bottleneck (v3, reused unchanged as stage 1 of the final model v6):** flatten (256×8×8 = 16,384) → `Linear` → **fixed-length 1-D
   latent vector of 256 floats** (the Phase 2 input). The global linear layer lets every latent
   coordinate combine evidence from the whole crop, so the code describes *what kind of scene* this
   is (terrain type, texture class, relief).
@@ -73,6 +73,12 @@ no transfer learning).
   visible, but each coordinate then mostly encoded *local brightness*, so the Isolation Forest
   isolated very bright or dark scenes instead of anomalies (see changelog). We therefore kept the
   global code.
+* **Final model (v6): two-stage autoencoder.** A second autoencoder of the same design, with a
+  64-float bottleneck, is trained on stage 1's amplified signed reconstruction residual,
+  128 + 127·clip(4·(x − x̂), −1, 1). The final latent is the **fixed-length 1-D vector
+  [256-d scene code | 64-d residual code] = 320 floats**. The scene code says *what kind of terrain*
+  the crop is; the residual code says *what the scene code could not explain*, which is where splices,
+  glitches and foreign content live. Both stages are trained from scratch on the competition crops only.
 * **Decoder:** mirror image: `Linear` (v4: 1×1 conv) back to the 8×8×256 map → five ×2
   transposed-conv stages to 256×256, centre-crop to 227×227, sigmoid. Cropping (rather than odd
   output-padding) keeps every stage a clean ×2.
@@ -85,7 +91,7 @@ T["latent_sweep"] = r"""
 The latent size trades **reconstruction fidelity** (a larger code keeps more detail) against
 **outlier separability**. An Isolation Forest splits on randomly chosen coordinates. If many latent
 dimensions carry redundant or near-constant information, most random splits are wasted and the
-isolation depth of true outliers gets diluted. We trained the final configuration with d ∈ {64, 128,
+isolation depth of true outliers gets diluted. We trained the stage-1 configuration (the scene code of the final model) with d ∈ {64, 128,
 256, 512} (short schedule) and measured three things:
 
 * held-out SSIM (fidelity)
@@ -104,7 +110,7 @@ Its fully differentiable terms (weights in `CONFIGS`) complement each other:
 * **(1 − SSIM)** with an 11×11 Gaussian window (σ = 1.5) compares local mean, contrast and structure.
   It penalises the loss of local structure even when the average brightness is right, which directly
   targets blur on ridges and crater rims.
-* **MSE / L1** anchors absolute brightness. SSIM is insensitive to uniform intensity offsets, so on
+* **L1** anchors absolute brightness. SSIM is insensitive to uniform intensity offsets, so on
   its own it can drift in albedo.
 * **Gradient L1** (finite-difference edges) penalises smeared or misplaced high-frequency edges,
   which helps sharp linear features such as ridgelines and scarps.
@@ -114,12 +120,15 @@ that is banned.
 
 **What the iterations taught us about this loss.** Switching from MSE (v1) to this combination (v2)
 sharpened crater rims and scarps, but it did **not** recover dune-ripple texture: held-out SSIM only
-went from 0.705 to 0.707. The binding constraint is the bottleneck, not the loss. 256 floats for
+went from 0.7053 to 0.7065. The binding constraint is the bottleneck, not the loss. 256 floats for
 51,529 pixels cannot store the exact phase of a ripple field, and a loss cannot recreate information
 the code has discarded. We keep the structural loss because it spends the unavoidable error on
 texture detail rather than on structure. Its edge sensitivity, however, made the network lock onto
 the razor-sharp edges of the no-data wedges (v2's novelty correlated 0.66 with the no-data share).
 That is why, from v3 on, every term is computed on valid pixels only (Section 0.2).
+
+**Stage-2 loss (v6).** The residual autoencoder reconstructs a signed residual image, not terrain, so
+structural similarity is not meaningful there; it uses MSE + 0.5·L1 on valid pixels.
 """
 
 T["tsne_intro"] = r"""
@@ -155,28 +164,28 @@ D'Agostino K² test, Q-Q plot). Then we compare three distribution-driven rules:
 """
 
 T["thr_choice"] = r"""
-### Choice: robust modified z-score > 3.5 → **threshold 0.5293, 86 crops flagged (0.83 %)**
+### Choice: robust modified z-score > 3.5 → **threshold 0.5251, 48 crops flagged (0.46 %)**
 
-1. **A Gaussian μ + kσ rule is not supported by the data.** The v3 scores have skewness 0.96,
-   excess kurtosis 0.98 and D'Agostino K² = 1,363 (p ≈ 0), and the Q-Q plot bends upward in the right
-   tail. Worse, μ and σ are estimated *including* the tail we are trying to find, so the outliers
+1. **A Gaussian μ + kσ rule is not supported by the data.** The final (v6) scores have skewness 0.75,
+   excess kurtosis 0.65 and D'Agostino K² = 885 (p ≈ 0), and the Q-Q plot bends upward in the right
+   tail. μ and σ are also estimated *including* the tail we are trying to find, so the outliers
    inflate their own threshold. We keep μ + 3σ only as a cross-check.
-2. **The elbow and GMM boundaries sit inside the body of the distribution, not at a break.** After
-   v3 removed the no-data mode, the score distribution is **unimodal**. A two-component GMM
-   therefore splits the single skewed bulk into two overlapping Gaussians, and its boundary falls
-   near the 71st percentile (2,986 crops). The Kneedle elbow of the *whole* sorted curve marks where
-   the curve leaves its straight middle section, at the start of the ordinary right skew of normal
-   terrain (1,513 crops). Neither boundary coincides with any change in the behaviour of the density.
-3. **The modified z-score is built for exactly this situation.** Median and MAD have a 50 %
-   breakdown point, so however many outliers exist they cannot move the threshold. k = 3.5 is the
-   value recommended by Iglewicz & Hoaglin (1993). If the bulk were Gaussian with this robust scale,
-   only about 2 of 10,422 normal crops would exceed it by chance (printed below).
-4. **Independent rules agree.** The robust rule (86) and the classical μ + 3σ cross-check (95) land
-   within 10 % of each other. On the sorted-score plot both sit at the foot of the final steep rise
-   (the last ~100 points), where the curve turns from gradual to near-vertical. This is exactly
-   the behaviour an elbow method should key on, once the elbow is sought in the tail rather than
-   across the whole curve.
-5. **Sensitivity is reported, not tuned.** The printout shows how the count moves for k = 3 … 5.
+2. **The elbow and GMM boundaries sit inside the body of the distribution, not at a break.** The score
+   distribution is unimodal. A two-component GMM therefore splits the single skewed bulk into two
+   overlapping Gaussians, and its boundary falls near the 64th percentile (3,740 crops). The Kneedle
+   elbow of the *whole* sorted curve marks where the curve leaves its straight middle section, at the
+   start of the ordinary right skew of normal terrain (987 crops). Neither boundary coincides with any
+   change in the behaviour of the density.
+3. **The modified z-score is built for exactly this situation.** Median and MAD have a 50 % breakdown
+   point, so however many outliers exist they cannot move the threshold. k = 3.5 is the value
+   recommended by Iglewicz & Hoaglin (1993). Under a Gaussian bulk with this robust scale about 2.4 of
+   10,422 normal crops would exceed it by chance; the real bulk is right-skewed, so this is a lower
+   bound, not a guarantee.
+4. **Cross-checks bracket the choice.** μ + 3σ flags 82 crops, and the same robust rule applied to
+   log-scores (which reduces the skew from 0.75 to 0.54) flags 22. The chosen 48 lies between the
+   classical and the skew-corrected rule, and on the sorted-score plot all three sit in the final
+   steep rise, where the curve turns from gradual to near-vertical.
+5. **Sensitivity is reported, not tuned.** k = 3, 3.5, 4 and 5 give 97, 48, 24 and 1 flagged crops.
    We keep the conventional k = 3.5 rather than choosing k to hit a count.
 """
 
@@ -187,6 +196,8 @@ print(f"FINAL NOVELTY THRESHOLD = {THRESHOLD:.4f}  ->  {flagged.sum()} of {len(n
 for k in (3.0, 3.5, 4.0, 5.0):          # sensitivity of the count to the cutoff constant (reported, not tuned)
     print(f"  k = {k}: threshold {mad_threshold(nov, k):.4f} -> {(nov > mad_threshold(nov, k)).sum()} flagged")
 print(f"expected chance exceedances if the bulk were Gaussian with the robust scale: {len(nov) * stats.norm.sf(3.5):.1f} crops")
+lt = np.log(nov)                          # skew-robust cross-check: the same rule on log-scores
+print(f"same rule on log-scores (skew {stats.skew(lt):.2f}): {(lt > mad_threshold(lt, 3.5)).sum()} flagged")
 '''
 
 T["contamination"] = r"""
@@ -220,10 +231,12 @@ flagged sets. The image-only pipeline remains the primary result.
 
 T["hm_intro"] = r"""
 The five highest-scoring crops **within the statistically thresholded set** are passed back through
-the decoder. The per-pixel squared error (lightly smoothed, σ = 2 px) is shown alone and overlaid on
-the original. To make the physical reading less subjective, we also compute descriptors of each
-error map and image (`heatmap_descriptors`). Each descriptor is reported as a percentile against 500
-random un-flagged crops:
+the Phase 1 decoder; for the two-stage final model this is stage 1's decoder, i.e. the image-space
+reconstruction. The per-pixel squared error (validity-weighted smoothing, σ = 2 px) is shown alone and
+overlaid on the original. The validity map is eroded by 3 px so JPEG ringing at a filled no-data
+boundary is not read as error, and each map uses a robust colour scale (99.5th percentile of valid
+pixels). To make the physical reading less subjective, we also compute descriptors of each error map
+and image (`heatmap_descriptors`), each reported as a percentile against 500 random un-flagged crops:
 
 * error **concentration** (share of error in the top 5 % of pixels)
 * **line score** (a single-row or single-column error spike, as a seam would produce)
@@ -234,8 +247,11 @@ random un-flagged crops:
 
 T["changelog_intro"] = r"""
 Every version was trained with identical data, schedule and seed. The table below is the
-quantitative evidence referenced in each changelog entry. The full journal is also in
-`CHANGELOG.md`.
+quantitative evidence referenced in each changelog entry, followed by the planted-fakes benchmark.
+The full journal is also in `CHANGELOG.md`.
+
+Note: `val_mse` / `val_ssim` of v1-v2 include no-data pixels, whereas v3 onwards are computed on valid
+pixels only, so those columns are not strictly like-for-like. v6 reports its stage-1 (= v3) values.
 """
 
 # ---------------------------------------------------------------- result-dependent narrative (v3 run)
@@ -250,70 +266,70 @@ differences are indicative, not conclusive.
   of the latent variance. Going to 512 adds 256 coordinates but only about 24 effective directions.
   The rest are redundant, and redundant coordinates **dilute an Isolation Forest**, whose splits pick
   a coordinate uniformly at random.
-* **Separability peaks at 256.** The tail ratio is 10.9, 9.5, 11.0 and 10.5. The correlation with the
+* **The separability proxy is flat.** The tail ratio is 10.9, 9.5, 11.0 and 10.5, too close to rank the
+  candidates; it also rewards nuisance modes (the rejected v2 scores 14.7), so it is only a sanity check. The correlation with the
   no-data fraction (the nuisance removed in v3) creeps up with size (0.03 → 0.08), because a bigger
   code has room to re-encode fill geometry.
 * **d = 128 is an outlier.** 90 % of its variance sits in only 8 components, a partial collapse
   under the short schedule, and it has the weakest tail.
 
-So 256 is the knee of the trade-off: the smallest code at which reconstruction fidelity is
-essentially saturated and the separability proxy is at its maximum.
+We therefore choose 256 on fidelity and effective dimensionality: it is the smallest code at which
+reconstruction fidelity is essentially saturated without adding largely redundant coordinates.
 """
 T["tsne_read"] = r"""
 **Reading the map (visual interpretation, not labels).**
 
-* **No collapse.** The projection is not one structureless blob. It has a dense core, extended
-  arms and several small isolated islands.
-* **Brightness is the dominant organising axis.** Mean intensity changes smoothly from bright
-  (lower left) to dark (upper right). Contrast varies more locally.
-* **Pixel scale is encoded too.** Crops from the single 1 m/px observation concentrate in one
-  region at the top right, and 0.5 m/px crops are over-represented on the right-hand side. The same
-  terrain imaged at a coarser scale has a different texture frequency.
-* **The no-data fraction is spread uniformly.** This is visual confirmation that v3's masking
-  removed the border nuisance that dominated v1 and v2.
-* The thumbnails show coherent neighbourhoods rather than discrete clusters: knobby and rough
-  terrain on the left, cratered plains in the centre, ripples and dunes, bright etched or polygonal
-  ground, and smooth dusty slopes. It is a continuum of terrain types.
-* After thresholding (Fig 1.3c, produced in Section 2.2), high Novelty Scores lie on the
-  **periphery and in the small islands**, and the dense core scores low, as expected if the
-  Isolation Forest isolates sparse regions. Flagged crops concentrate at the bright lower edge and
-  the dark upper-right edge, which is the visible trace of v3's residual brightness bias
-  (changelog, v4 entry).
+* **No collapse.** The projection is not one structureless blob. It has a dense core, extended arms and
+  several small isolated islands.
+* **Brightness is the dominant organising axis.** Mean intensity changes smoothly from one side of the
+  map to the other; contrast varies more locally.
+* **Pixel scale is encoded too.** Crops from the single 1 m/px observation concentrate in one compact
+  region, and 0.5 m/px crops are over-represented in parts of the map. The same terrain imaged at a
+  coarser scale has a different texture frequency.
+* **The no-data fraction is spread uniformly.** This is visual confirmation that masking removed the
+  border nuisance that dominated v1 and v2.
+* The thumbnails show coherent neighbourhoods rather than discrete clusters (knobby and rough terrain,
+  cratered plains, ripples and dunes, bright etched or polygonal ground, smooth dusty slopes): a
+  continuum of terrain types.
+* After thresholding (Fig 1.3c, produced in Section 2.2), flagged crops lie mainly on the **periphery
+  of the map and in its outer lobes**, with only a few in the interior, as expected if the Isolation
+  Forest isolates sparse regions.
 """
 
 T["loc_read"] = r"""
-**Findings.**
+**Findings (final model v6).**
 
-* Flags are spread over 39 of the 172 source observations, but **4 sources are significantly
-  enriched** (one-sided binomial test against the 0.83 % base rate, Bonferroni-corrected p < 0.05).
-  The two strongest are both **north-polar (90° N)**: SRC_039 has **13 of its 16 crops** flagged and
-  SRC_166 has 6 of 16. Together they contribute 19 of the 86 flags. The other two are SRC_067
-  (7 of 92, 15° S) and SRC_032 (3 of 14, 5° S).
-* **Physical reading: rare terrain, not tampering.** North-polar crops show bright ice, finely banded
-  layered deposits and scarps. For example, the "stripes" of 08731 and 03423 are polar layering, not
-  sensor banding. This terrain is a small minority of the training crops, so its latents are easy
-  to isolate. A mission pipeline would *route* these flags to the polar science team rather than
-  discard them. The metadata is what tells us these flags are a terrain class, not artefacts.
-* **Latitude.** Between 45° S and 55° N the flag rate fluctuates around the base rate (0-1.5 %), then
-  jumps at 60° N (≈4.4 %) and 90° N (≈5 %). Correlation with |latitude| overall is negligible
-  (ρ = 0.03), so the effect is confined to the high northern bands.
-* **Illumination.** ρ(sun angle, novelty) = −0.04. It is statistically significant only because
-  n = 10,422; the effect size is negligible, and flagged crops span the whole 36-79° range.
-* **Season.** The score *distributions* differ slightly (Kruskal-Wallis p = 0.002), but *flagging*
-  is independent of season (χ² p = 0.48).
-* **Resolution.** Scores differ strongly by resolution (p ≈ 10⁻¹¹), consistent with the t-SNE
-  observation that pixel scale changes texture frequency. Yet the lone 1 m/px observation (SRC_111)
-  has only 2 of 137 crops flagged, so scale shifts the bulk of the distribution but does not by
-  itself produce flags.
+* The 48 flags come from 30 of the 172 source observations. **Two sources are significantly
+  enriched** (one-sided binomial test against the 0.46 % base rate, Bonferroni-corrected p < 0.05),
+  and both are in the **90° N metadata bin**: SRC_039 (9 of its 16 crops flagged) and SRC_166 (3 of 16).
+  Together they hold 12 of the 48 flags.
+* **Physical reading: most likely rare terrain, not tampering.** These crops show bright ice-rich
+  surfaces, finely banded layered deposits and scarps (e.g. the "stripes" of 08731 are layering, not
+  sensor banding). This terrain is a small minority of the training crops, so its latents are easy to
+  isolate. A mission pipeline would *route* such flags to the polar team rather than discard them; the
+  metadata is what identifies them as a terrain class. Latitude is binned (the grid jumps from 60° to a
+  90° bin), so "90° N" is a bin, not the pole itself; the 90° S bin has no flags.
+* **The injected content is not location-specific.** The four Earth-like crops in the top 6 (06476,
+  07971, 07701, 09828) come from four different observations between 35° S and 15° N, as expected if
+  foreign crops were inserted at random positions.
+* **Latitude.** Outside the 90° N bin the flag rate fluctuates around the base rate (0-1.1 %).
+  Correlation with |latitude| is negligible (ρ = 0.06).
+* **Illumination.** ρ(sun angle, novelty) = −0.03: detectable only because n = 10,422 and negligible in
+  size; flagged crops span 36-79° of the dataset's 32-86° range.
+* **Season.** Score *distributions* differ slightly between seasons (Kruskal-Wallis p ≈ 6·10⁻⁵), but
+  *flagging* is independent of season (χ² p = 0.53).
+* **Resolution.** Scores differ by resolution (p ≈ 10⁻⁶), consistent with the t-SNE observation that
+  pixel scale changes texture frequency. The lone 1 m/px observation (SRC_111) has 2 of 137 crops
+  flagged, so scale shifts the bulk of the distribution but does not by itself produce flags.
 """
 
 T["fusion_read"] = r"""
-Fusion changes little: 93 crops are flagged against 86 image-only, with 83 in common (Jaccard 0.86)
-and a rank correlation of 0.992 between the two scorings. Fusion adds 10 crops and drops 3. Two
+Fusion changes little: 54 crops are flagged against 48 image-only, with 46 in common (Jaccard 0.82)
+and a rank correlation of 0.993 between the two scorings; fusion adds 8 crops and drops 2. Two
 reasons explain the small effect:
 
-1. The Isolation Forest picks split features uniformly at random, and only 10 of the 266 fused
-   dimensions are metadata, so metadata drives about 4 % of splits.
+1. The Isolation Forest picks split features uniformly at random, and only 10 of the 330 fused
+   dimensions are metadata, so metadata drives about 3 % of splits.
 2. Every crop from one observation shares identical metadata. Metadata can therefore isolate an
    unusual *observation*, but never a single crop within it, whereas the injected anomalies are
    single crops.
@@ -324,74 +340,58 @@ polar enrichment), rather than as an input to detection.
 
 T["geo_report"] = r"""
 These are **hypotheses**, argued from the heatmap pattern, the descriptors (with percentiles against
-500 normal crops) and the metadata. They are not definitive classifications.
+500 normal crops) and the metadata. They are not definitive classifications. A quantitative pattern
+runs through the top 5: the three crops whose error is **diffuse** (concentration at the 2nd-5th
+percentile) are exactly the three with **very high** reconstruction error (0.016-0.030, against
+0.003-0.005 for the other two), and all three look man-made.
 
-**#1 sample_00849 (SRC_022, 20° N): straight albedo boundary. Hypothesis: spliced terrain or a
-mosaic seam.** A bright slope with gullies is cut by a *straight*, full-height boundary to a uniformly
-darker band (seam step 0.42, the 100th percentile; the crop is also brighter than every reference crop).
-Natural albedo contacts on Mars follow topography and are rarely ruler-straight across a whole
-frame. A straight contact between two unrelated surfaces is the signature of **semantic splicing**,
-or, less exotically, of a seam between two HiRISE CCD channels with mismatched gain. The
-reconstruction error is low (the decoder draws both halves and the boundary), so the flag comes from
-the *rarity of the configuration* in latent space, not from a failure to encode it. The only
-concentrated error sits on the edge of the small filled no-data wedge at the left, so part of this
-crop's score may be the residual no-data effect noted in the changelog.
+**#1 sample_06476 (SRC_158, 5° S): straight rows of rounded, shadow-casting objects. Hypothesis:
+terrestrial content (an orchard or plantation seen from above).** A near-perfect lattice of rounded
+blobs in straight rows is a geometry no Martian process produces at this scale. The decoder, which has
+only a Martian vocabulary, returns a smeared stripe pattern; the error covers **every blob in the
+frame** (concentration 0.16, 2nd percentile) and the reconstruction error is at the 100th percentile of
+the dataset (0.0295). This is the textbook **non-Martian domain-shift** signature.
 
-**#2 sample_06917 (SRC_122, 5° S): fresh crater filling the frame. Hypothesis: genuine, rare geology.**
-The error forms a **ring that follows the crater rim**, with streaks down the inner walls. Its
-concentration is low (33rd percentile), spread along the whole rim. A sharp-rimmed impact crater with
-gullied walls, a shadowed wall and a bright floor is a high-relief, high-frequency structure that a
-256-float global code can only sketch. Such large fresh craters are uncommon at this crop scale,
-where most crops are plains, dunes and knobby terrain. The pattern is physically coherent (the error
-sits exactly where relief is steepest) and does *not* resemble any of the injection signatures.
+**#2 sample_06963 (SRC_166, 90° N bin): bright plain with dark, angular knobs. Hypothesis: genuine
+polar terrain.** A bright, smooth surface carries scattered dark knobs and a dark scarp margin at the
+bottom. The error is **concentrated on the dark relief** (concentration at the 88th percentile) and
+the reconstruction error is low (0.0051), so the decoder understands the scene and only misses the
+sharp dark features. SRC_166 is one of the two significantly enriched polar observations (2.3).
 
-**#3 sample_05849 (SRC_008, 25° N): crater or pit with a fully black shadow. Hypothesis: genuine
-steep-walled depression at the limit of the sensor's dynamic range.** 11 % of the pixels are clipped
-at 0 (saturation at the 100th percentile). The error traces the **rim and the sunlit wall**, where
-the illuminated rock meets the clipped shadow. The shadow sits on the wall facing away from the sun,
-consistent with the illumination of the surrounding small craters, which argues for real topography
-rather than a synthetic black blob. An exposure set for the bright plain cannot record the shadowed
-interior, so it clips. This is either a very deep fresh crater or a collapse pit. It is rare, but
-Martian.
+**#3 sample_07971 (SRC_078, 15° N): densely packed rounded crowns. Hypothesis: terrestrial content
+(tree canopy or orchard).** Tightly packed, rounded, textured crowns with dark gaps between them form a
+loose grid. As for #1, the error is **spread across the whole frame** (concentration 0.18, 5th
+percentile) and the reconstruction error is very high (0.0157), with the decoder falling back to a
+blurred cratered texture. Diffuse whole-frame failure again points to a **domain shift** rather than
+an unusual Martian feature.
 
-**#4 sample_03423 (SRC_128, 90° N): polar layered terrain with a large filled no-data area.
-Hypothesis: genuine polar geology plus the residual no-data effect.** The valid area is a rotated
-strip, with the two wedges masked and filled. It shows a bright, smooth upper surface and a darker
-lower surface separated by a curved scarp with fine parallel banding (periodicity at the 98th
-percentile). At 90° N this is the morphology of the **north polar layered deposits**, stacked ice and
-dust layers exposed on a scarp. The reconstruction error is the *lowest* of the top 5, so again the
-novelty is configurational: rare polar terrain, and an unusually large flat fill region, as
-discussed in the v3/v4 changelog.
+**#4 sample_03383 (SRC_067, 15° S): dark, low-sun rugged relief. Hypothesis: genuine massifs or ridges
+under oblique illumination.** The frame is darker than 99 % of reference crops, its contrast is at the
+99th percentile, and the error is concentrated on the **thin sunlit crests** (concentration at the
+96th percentile), not in the shadows. Long shadows from steep spurs make a high-contrast,
+high-frequency pattern whose exact crest geometry the code cannot store: rare, but Martian.
 
-**#5 sample_03383 (SRC_067, 15° S): dark, low-sun rugged relief. Hypothesis: genuine massifs or
-ridges under oblique illumination.** The frame is darker than 99 % of reference crops, and its
-contrast is at the 98th percentile. The error is concentrated on the **thin sunlit crests**, not in
-the shadows. Long shadows from steep spurs make a high-contrast, high-frequency pattern whose exact
-crest geometry the code cannot store. SRC_067 is one of the four significantly enriched sources
-(7 flags in 92 crops), which is what we would expect if the whole observation images unusual rugged
-terrain.
+**#5 sample_07701 (SRC_136, 35° S): evenly spaced bright bars inside rectangles, beside straight
+lines. Hypothesis: terrestrial content (runway or apron markings) or a synthetic insertion.** Two
+rectangular blocks of parallel bright bars bounded by straight edges sit next to a straight bright band
+and a thin line network: rectilinear, periodic, painted-looking geometry. The error follows **every bar
+and edge** (concentration 0.16, 3rd percentile; seam step at the 100th percentile because of the sharp
+straight boundaries) and the reconstruction error is high (0.0170). The regularity and the diffuse
+failure match the domain-shift signature of #1 and #3. v3 flagged this crop but ranked it much lower;
+v6's residual code lifted it into the top 5.
 
-**Beyond the top 5 (Fig 3.1b, diagnostic).** The heatmap *pattern* separates the injected content
-from the rare geology above:
-
-* The **Pentagon** aerial photograph (rank 47) and the **periodic grid** (rank 11), which on close
-  inspection resembles an orchard (rows of trees seen from above), have the two highest
-  reconstruction errors in the whole dataset (100th percentile). Their error is **spread
-  diffusely over the entire frame** (concentration 0.18 and 0.16, i.e. almost uniform). The decoder
-  has no Martian vocabulary for rectilinear buildings or a perfect lattice, so it fails everywhere.
-  This is the textbook **non-Martian domain-shift** signature.
-* The **black bar** and **two streaks**, which are *not* flagged by the latent score (ranks 1,120 and
-  2,211), nevertheless sit in the **top 1 % of reconstruction error**, with the error lying *along the
-  straight dark defect* (line scores 4.6 and 5.4). This is the **synthetic sensor-artefact**
-  signature, and it shows the global latent's blind spot for small local defects (changelog, v3
-  and v4).
+**Beyond the top 5 (Fig 3.1b, diagnostic).** The **Pentagon** aerial photograph ranks 6th, with
+reconstruction error at the 100th percentile spread diffusely over the frame (concentration 0.18). The
+**black bar** and **two streaks** are not flagged (ranks 344 and 2,517) but sit at the 99.4th and
+98.6th percentiles of reconstruction error, with the error lying *along the straight dark defect* (line
+scores 4.6 and 5.4, the highest in the table): the **synthetic sensor-artefact** signature, still
+partly hidden from the latent. The dead-pixel blocks are invisible even to the residual (52nd
+percentile).
 
 | heatmap pattern | examples | physical hypothesis |
 |---|---|---|
-| ring following a rim, error on steep walls | 06917, 05849 | real high-relief feature beyond the code's resolution (rare geology) |
-| error on thin bright crests of a dark frame | 03383 | oblique illumination of rugged relief |
-| low error, high novelty | 00849, 03423 | rare *configuration*: straight seam (splice / CCD seam) or polar terrain + large fill |
-| intense error spread over the whole frame | Pentagon 09828, grid 06476 | domain shift: non-Martian content |
+| intense error over the whole frame + very high reconstruction error | 06476, 07971, 07701, Pentagon 09828 | domain shift: non-Martian (man-made) content |
+| error concentrated on sharp relief, low reconstruction error | 06963, 03383 | rare genuine terrain (polar knobs, low-sun ridges) |
 | error along a straight dark line | bar 00015, streaks 00503 | synthetic sensor artefact (missed by the latent) |
 """
 
@@ -402,26 +402,42 @@ T["final"] = r"""
 
 | | |
 |---|---|
-| **Final model** | **v3**: convolutional autoencoder trained from scratch; global linear bottleneck → fixed-length **256-d 1-D latent**; loss 0.84·(1−SSIM) + 0.16·L1 + 0.1·Gradient-L1 on valid pixels; map-projection no-data wedges masked |
+| **Final model** | **v6**: two-stage convolutional autoencoder trained from scratch. Stage 1 (= v3): global linear bottleneck → 256-d scene code, loss 0.84·(1−SSIM) + 0.16·L1 + 0.1·Gradient-L1 on valid pixels, map-projection no-data masked. Stage 2: 64-d code of the stage-1 reconstruction residual. Final fixed-length **320-d 1-D latent** |
 | **Novelty Score** | Isolation Forest s(x, n) on the latents (500 trees × 5 seeds); **higher = more anomalous** |
-| **Statistical threshold** | robust modified z-score > 3.5 (median + 3.5·MAD/0.6745) = **0.5293** |
-| **Crops flagged** | **86 of 10,422 (0.83 %)**, listed in `outputs/flagged_anomalies.csv` |
-| **Top-5 (Phase 3)** | sample_00849, sample_06917, sample_05849, sample_03423, sample_03383 |
+| **Statistical threshold** | robust modified z-score > 3.5 (median + 3.5·MAD/0.6745) = **0.5251** |
+| **Crops flagged** | **48 of 10,422 (0.46 %)**, listed in `outputs/flagged_anomalies.csv` |
+| **Top-5 (Phase 3)** | sample_06476, sample_06963, sample_07971, sample_03383, sample_07701 |
+| **Location (2.3)** | 2 of 172 observations significantly enriched, both in the 90° N bin (12 of the 48 flags); the Earth-like crops come from four different observations |
+| **Fusion (2.4)** | 54 flagged with metadata vs 48 image-only (Jaccard 0.82): metadata explains flags rather than finding them |
+| **Heatmaps (3.2)** | diffuse whole-frame error + very high reconstruction error = non-Martian content (3 of the top 5, plus the Pentagon at #6); error on sharp relief = rare genuine terrain; straight-line error = seam / glitch |
 
 </div>
 
 **Key findings**
 
-1. The decisive fix was **not** the loss but the data. Masking the map-projection no-data wedges
-   (v3) removed a nuisance mode that had made every v1/v2 flag a border crop. It turned a bimodal
-   score distribution into a unimodal one with a genuine tail.
-2. The flagged set contains **clear non-Martian content** (an aerial photograph of the Pentagon,
-   perfectly periodic grids), recognisable in Phase 3 by diffuse whole-frame reconstruction error.
-   It also contains **rare genuine terrain** (north-polar layered deposits, fresh deep craters),
-   which the metadata join (2.3) identifies as a terrain class concentrated in two polar
-   observations.
-3. The spatial bottleneck (v4) was tried and **rejected**, because its coordinates encoded local
-   brightness.
-4. **Limitations:** small local sensor defects are missed by latent-space scoring (the residual
-   catches two of three), and recall for terrestrial content is incomplete (sample_05508).
+1. **The decisive data fix** was masking the map-projection no-data wedges (v3). It removed a nuisance
+   mode that had made about 96 % of v1/v2 flags border crops, and turned a bimodal score distribution
+   into a unimodal one with a genuine tail.
+2. **The decisive representation fix** was the two-stage residual latent (v6). On 2,400 planted fakes
+   it raised the mean AUROC from 0.735 to 0.775 (raw pixels: 0.45), made novelty agree more with
+   reconstruction failure (ρ 0.44 → 0.57) and reduced the brightness bias. The Earth-like images now
+   rank 1, 3, 5 and 6.
+3. Two versions were tried and **rejected**: a spatial bottleneck (v4; its coordinates encoded local
+   brightness) and per-crop photometric normalisation (v5; it made fakes look more typical).
+4. **Limitations:** thin streaks and dead-pixel blocks are still missed by latent-space scoring, one
+   aerial-buildings image (05508) ranks 156th, and rare polar terrain competes with injected content in
+   the tail.
+"""
+
+T["bench_intro"] = r"""
+### Planted-fakes benchmark (model-selection evidence)
+
+Without ground truth a model cannot be scored directly. `benchmark.py` therefore plants 2,400 synthetic
+anomalies into clean crops: 300 each of eight types, namely straight-seam and patch splices; bars,
+blocks, gain stripes and line dropouts; and periodic and rectilinear man-made textures. The fakes pass
+through exactly the same pre-processing as real crops and are scored by each version's Isolation Forest
+fitted on the **real** crops only. AUROC measures how well a version ranks fakes above real crops
+(0.5 = chance); recall is the share caught by that version's own statistical threshold. The threshold
+rule is **never** tuned on this benchmark. It is used only to compare versions, and it is a proxy,
+because our generators may differ from the organisers' injections.
 """

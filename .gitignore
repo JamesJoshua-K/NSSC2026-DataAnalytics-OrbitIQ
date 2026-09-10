@@ -18,3 +18,8 @@ outputs/*.png
 _dryrun*.ipynb
 __pycache__/
 .ipynb_checkpoints/
+
+# LaTeX build by-products
+report/*.log
+report/*.aux
+report/*.out

@@ -31,19 +31,20 @@ def main():
 
     idx = pd.read_csv(os.path.join(ROOT, "data/crop_metadata_index.csv"))
     X = np.load(os.path.join(ROOT, "cache/images_u8.npy"))
-    weights = None
-    if cfg.get("trim_from"):
-        prev = np.load(os.path.join(ROOT, "outputs", cfg["trim_from"], "novelty.npy"))
-        weights = np.ones(len(X))
-        weights[prev > cfg["trim_threshold"]] = 0.0
-        print("trimmed training: excluding", int((weights == 0).sum()), "crops")
+    weights = None   # uniform sampling of all crops (no data-cleaning of any kind)
 
-    M = None
-    if cfg.get("nodata"):
-        M = compute_nodata_masks(X, os.path.join(ROOT, "cache/nodata_masks.npy"))
-        X = fill_nodata(X, M)
+    pcfg = CONFIGS[cfg["residual_of"]] if cfg.get("residual_of") else cfg   # stage 1 sees exactly its own input
+    X, M = preprocess(pcfg, X, mask_cache=os.path.join(ROOT, "cache/nodata_masks.npy"))
+    if M is not None:
         print("no-data masks: %.1f%% of crops have masked pixels" % (100 * M.reshape(len(M), -1).any(1).mean()))
+    Z1 = None
+    if cfg.get("residual_of"):   # two-stage: stage 2 is trained on the residual of the trained stage-1 model
+        stage1 = load_model(cfg["residual_of"], os.path.join(ROOT, "outputs"))
+        Z1, mse1, ssim1 = embed_and_reconstruct(stage1, X, M)
+        X = residual_images(stage1, X, M)
+        print("stage 2 trains on the reconstruction residuals of", cfg["residual_of"])
 
+    seed_everything(42)   # identical initial weights on every run
     model = ConvAE(**cfg["model"])
     print(name, cfg, "params %.2fM" % (sum(p.numel() for p in model.parameters()) / 1e6))
     model, hist, val_idx = train_autoencoder(model, X, ReconLoss(**cfg["loss"]), epochs=cfg["epochs"],
@@ -53,6 +54,8 @@ def main():
     json.dump(cfg, open(os.path.join(out, "config.json"), "w"), indent=1)
 
     Z, mse, ssim = embed_and_reconstruct(model, X, M)
+    if Z1 is not None:
+        Z, mse, ssim = np.hstack([Z1, Z]), mse1, ssim1   # final latent = [scene code | residual code]
     np.save(os.path.join(out, "latents.npy"), Z)
     np.save(os.path.join(out, "recon_mse.npy"), mse)
     np.save(os.path.join(out, "recon_ssim.npy"), ssim)
@@ -76,7 +79,7 @@ def main():
     for nm, t in [("MAD3.5", t_mad), ("kneedle", t_knee), ("GMM", t_gmm), ("mu+3sd", t_ms)]:
         print(f"  thr {nm:8s} {t:.4f} -> flagged {(nov > t).sum()}")
     print("seed-std of novelty: median %.4f" % np.median(nov_sd))
-    nodata = np.load(os.path.join(ROOT, "cache/nodata_frac.npy"))
+    nodata = (np.load(os.path.join(ROOT, "cache/images_u8.npy")) <= 2).mean((1, 2))
     summary = dict(version=name, latent_dim=cfg["model"]["latent_dim"], epochs=cfg["epochs"],
                    val_mse=float(hist.val_mse.iloc[-1]), val_ssim=float(hist.val_ssim.iloc[-1]),
                    pca90=int(np.searchsorted(np.cumsum(pca_var), .9) + 1),

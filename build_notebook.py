@@ -30,11 +30,23 @@ DATA, OUT, CACHE = [os.path.join(ROOT, d) for d in ("data", "outputs", "cache")]
 IMG_DIR = os.path.join(DATA, "images_unz", "images")      # images.zip extracted here
 FIG = os.path.join(OUT, "figures"); os.makedirs(FIG, exist_ok=True); os.makedirs(CACHE, exist_ok=True)
 RETRAIN = False     # True: retrain every version from scratch (~6 min each on an RTX 5070 Laptop GPU)
-VERSIONS = ["v1", "v2", "v3", "v4"]
-FINAL = "v3"        # version used for Phases 2-3 (v4 was tried and rejected - see changelog)
+VERSIONS = ["v1", "v2", "v3", "v4", "v5", "v6"]
+FINAL = "v6"        # version used for Phases 2-3: two-stage model (v4, v5 tried and rejected - see changelog)
 seed_everything(42)
 print("torch", torch.__version__, "| device:", DEVICE, torch.cuda.get_device_name(0) if DEVICE.type == "cuda" else "")
 def savefig(name): plt.savefig(os.path.join(FIG, name), dpi=130, bbox_inches="tight")
+''')
+code('''
+# Google Colab / fresh-machine support: fetch the competition data if it is not already present
+# (a no-op when data/ exists). Source: the organisers' Google Drive folder linked in the rules PDF.
+import sys, subprocess, zipfile
+DATA_URL = "https://drive.google.com/drive/folders/19RPd0thhM5CI4xrImE0Jjlak9GPZwC_O"
+if not os.path.exists(os.path.join(DATA, "crop_metadata_index.csv")):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "gdown"], check=True)
+    subprocess.run([sys.executable, "-m", "gdown", "--folder", DATA_URL, "-O", DATA], check=True)
+if not os.path.isdir(IMG_DIR):
+    zipfile.ZipFile(os.path.join(DATA, "images.zip")).extractall(os.path.join(DATA, "images_unz"))
+print("running on", "Google Colab" if "google.colab" in sys.modules else "local Jupyter", "| data ready:", os.path.isdir(IMG_DIR))
 ''')
 sec("configs")
 
@@ -74,7 +86,9 @@ sec("nodata")
 code('''
 M = compute_nodata_masks(X, cache_path=os.path.join(CACHE, "nodata_masks.npy"))
 Xf = fill_nodata(X, M)
-INPUT = {v: ((Xf, M) if CONFIGS[v].get("nodata") else (X, None)) for v in VERSIONS}   # model input per version
+BASE = {v: CONFIGS[v].get("residual_of", v) for v in VERSIONS}   # image-space (stage-1) model of each version
+# model input per version (the stage-1 input for two-stage versions), via the same preprocess() used in training
+INPUT = {v: preprocess(CONFIGS[BASE[v]], X, mask_cache=os.path.join(CACHE, "nodata_masks.npy")) for v in VERSIONS}
 has_mask = M.reshape(len(M), -1).any(1)
 near_black = (flat <= 5).mean(1)
 print(f"crops with a masked no-data wedge: {has_mask.mean():.1%} (mean masked share {M[has_mask].mean():.1%})")
@@ -133,16 +147,15 @@ code('''
 def train_or_load(v):
     """Train version v (or load its checkpoint produced by exactly this code)."""
     cfg, out = CONFIGS[v], os.path.join(OUT, v)
+    seed_everything(42)   # identical initial weights on every run
     model = ConvAE(**cfg["model"])
     if RETRAIN or not os.path.exists(os.path.join(out, "model.pt")):
         os.makedirs(out, exist_ok=True)
-        weights = None
-        if cfg.get("trim_from"):   # v3: exclude crops the previous version flagged
-            prev = np.load(os.path.join(OUT, cfg["trim_from"], "novelty.npy"))
-            weights = (prev <= cfg["trim_threshold"]).astype(float)
         Xin, Min = INPUT[v]
+        if cfg.get("residual_of"):   # two-stage: stage 2 learns the stage-1 reconstruction residual
+            Xin = residual_images(R[cfg["residual_of"]]["model"], Xin, Min)
         model, hist, _ = train_autoencoder(model, Xin, ReconLoss(**cfg["loss"]), epochs=cfg["epochs"],
-                                           lr=cfg["lr"], sample_weights=weights, masks_u8=Min)
+                                           lr=cfg["lr"], masks_u8=Min)
         torch.save(model.state_dict(), os.path.join(out, "model.pt")); hist.to_csv(os.path.join(out, "history.csv"), index=False)
     model.load_state_dict(torch.load(os.path.join(out, "model.pt"), map_location=DEVICE))
     return model.to(DEVICE).eval(), pd.read_csv(os.path.join(out, "history.csv"))
@@ -150,8 +163,12 @@ def train_or_load(v):
 R = {}
 for v in VERSIONS:
     model, hist = train_or_load(v)
-    Z, mse, ssim = embed_and_reconstruct(model, *INPUT[v])   # v3: filled input, metrics on valid pixels
-    R[v] = dict(model=model, hist=hist, Z=Z, mse=mse, ssim=ssim)
+    # final fixed-length 1-D latent (two-stage versions: [stage-1 scene code | stage-2 residual code]);
+    # mse/ssim are the stage-1 (image-space) reconstruction errors on valid pixels
+    Z, mse, ssim = version_latents(v, X, OUT, mask_cache=os.path.join(CACHE, "nodata_masks.npy"))
+    two = BASE[v] != v
+    R[v] = dict(model=R[BASE[v]]["model"] if two else model, stage2=model if two else None,
+                hist=R[BASE[v]]["hist"] if two else hist, Z=Z, mse=mse, ssim=ssim)
     print(f"{v}: final val MSE {hist.val_mse.iloc[-1]:.5f} | val SSIM {hist.val_ssim.iloc[-1]:.4f} | "
           f"epochs {len(hist)} | {hist.sec.sum()/60:.1f} min")
 ''')
@@ -313,7 +330,7 @@ for fl, c in [(False, "0.6"), (True, "r")]:
     d = scored[scored.flagged == fl]; ax[1].scatter(d.sun_angle, d.novelty, s=3 if not fl else 14, c=c, label="flagged" if fl else "normal")
 ax[1].axhline(THRESHOLD, c="r", ls="--"); ax[1].set_xlabel("sun angle (°)"); ax[1].set_ylabel("Novelty Score"); ax[1].legend()
 order_s = ["N-spring", "N-summer", "N-autumn", "N-winter"]
-ax[2].boxplot([scored.novelty[scored.season == s] for s in order_s], labels=order_s, showfliers=True, flierprops=dict(ms=2))
+ax[2].boxplot([scored.novelty[scored.season == s] for s in order_s], tick_labels=order_s, showfliers=True, flierprops=dict(ms=2))
 ax[2].axhline(THRESHOLD, c="r", ls="--"); ax[2].set_title("Novelty Score by season")
 plt.tight_layout(); savefig("fig10_location.png"); plt.show()
 from scipy.stats import spearmanr, kruskal, chi2_contingency
@@ -361,16 +378,20 @@ top5 = flag_idx[np.argsort(-nov[flag_idx])][:5]      # top-5 *within* the thresh
 Xin, Min = INPUT[FINAL]                                # v3 decoder input: no-data filled
 orig, rec = reconstruct(R[FINAL]["model"], Xin, top5)
 valid = np.ones_like(orig) if Min is None else 1.0 - Min[top5]
+# erode the validity map by 3 px so JPEG ringing at a filled-wedge boundary is not read as error
+valid = np.stack([ndimage.binary_erosion(v > 0, iterations=3, border_value=1) for v in valid]).astype(float)
 fig, ax = plt.subplots(len(top5), 4, figsize=(15, 3.8 * len(top5)), squeeze=False)
 desc = []
 for r_, i in enumerate(top5):
     e = error_map(orig[r_], rec[r_], valid=valid[r_])  # no-data pixels carry no error by construction
+    vmax = np.percentile(e[valid[r_] > 0], 99.5)       # robust colour scale: a few hot pixels cannot wash out the map
     desc.append(dict(rank=r_ + 1, filename=crop_index.filename[i], source=crop_index.source_image_id[i],
                      novelty=nov[i], recon_mse=R[FINAL]["mse"][i], **heatmap_descriptors(orig[r_], e, valid[r_])))
     ax[r_, 0].imshow(X[i], cmap="gray", vmin=0, vmax=255); ax[r_, 0].set_title(f"#{r_+1} {crop_index.filename[i]}  novelty {nov[i]:.3f}")
     ax[r_, 1].imshow(rec[r_], cmap="gray", vmin=0, vmax=1); ax[r_, 1].set_title(f"{FINAL} reconstruction")
-    im = ax[r_, 2].imshow(e, cmap="inferno"); plt.colorbar(im, ax=ax[r_, 2], fraction=.046); ax[r_, 2].set_title("squared error (σ=2 smoothed)")
-    ax[r_, 3].imshow(X[i], cmap="gray", vmin=0, vmax=255); ax[r_, 3].imshow(e, cmap="inferno", alpha=.55)
+    im = ax[r_, 2].imshow(e, cmap="inferno", vmin=0, vmax=vmax); plt.colorbar(im, ax=ax[r_, 2], fraction=.046)
+    ax[r_, 2].set_title("squared error (σ=2 px, 99.5th-pct scale)")
+    ax[r_, 3].imshow(X[i], cmap="gray", vmin=0, vmax=255); ax[r_, 3].imshow(e, cmap="inferno", alpha=.55, vmin=0, vmax=vmax)
     ax[r_, 3].set_title("overlay")
 for a in ax.ravel(): a.axis("off")
 plt.tight_layout(); savefig("fig11_heatmaps_top5.png"); plt.show()
@@ -382,6 +403,7 @@ rng = np.random.default_rng(0); ref_idx = rng.choice(np.where(~flagged)[0], 500,
 Xin, Min = INPUT[FINAL]
 o_, r_ = reconstruct(R[FINAL]["model"], Xin, ref_idx)
 v_ = np.ones_like(o_) if Min is None else 1.0 - Min[ref_idx]
+v_ = np.stack([ndimage.binary_erosion(v > 0, iterations=3, border_value=1) for v in v_]).astype(float)
 ref = pd.DataFrame([heatmap_descriptors(o_[k], error_map(o_[k], r_[k], valid=v_[k]), v_[k]) for k in range(len(ref_idx))])
 pct = desc[ref.columns].apply(lambda col: [(ref[col.name] < v).mean() * 100 for v in col])
 pct.insert(0, "filename", desc.filename)
@@ -395,11 +417,14 @@ idx_s = np.array([k - 1 for k in supp])
 Xin, Min = INPUT[FINAL]
 o_s, r_s = reconstruct(R[FINAL]["model"], Xin, idx_s)
 v_s = np.ones_like(o_s) if Min is None else 1.0 - Min[idx_s]
+v_s = np.stack([ndimage.binary_erosion(v > 0, iterations=3, border_value=1) for v in v_s]).astype(float)
 rank_all = (-nov).argsort().argsort() + 1
 fig, ax = plt.subplots(2, len(idx_s), figsize=(2.8 * len(idx_s), 6.2))
 for j, (i, lab) in enumerate(zip(idx_s, supp.values())):
     e = error_map(o_s[j], r_s[j], valid=v_s[j])
     mse_pct = (R[FINAL]["mse"] < R[FINAL]["mse"][i]).mean() * 100
+    d_ = heatmap_descriptors(o_s[j], e, v_s[j])
+    print(f"{lab:24s} rank {rank_all[i]:5d} | recon-MSE percentile {mse_pct:5.1f} | concentration {d_['concentration']:.2f} | line score {d_['line_score']:.1f}")
     ax[0, j].imshow(X[i], cmap="gray", vmin=0, vmax=255)
     ax[0, j].set_title(f"{lab}\\n{crop_index.filename[i]} | rank {rank_all[i]} | {'FLAGGED' if flagged[i] else 'not flagged'}", fontsize=8)
     ax[1, j].imshow(X[i], cmap="gray", vmin=0, vmax=255); ax[1, j].imshow(e, cmap="inferno", alpha=.6)
@@ -455,6 +480,16 @@ for v in VERSIONS:
     spot[f"{v} rank"] = [int(rank[k - 1]) for k in SPOT]
     spot[f"{v} flagged"] = [bool(n_[k - 1] > thr_v) for k in SPOT]
 print(spot.to_string())
+''')
+md(T["bench_intro"])
+code('''
+bench = pd.concat([pd.read_csv(p, index_col=0) for p in sorted(glob.glob(os.path.join(OUT, "bench_*_summary.csv")))])
+bench = bench[~bench.index.duplicated(keep="last")]
+cols = ["auroc_splice", "auroc_glitch", "auroc_domain", "auroc_mean", "recall_mean", "n_flag_real", "auroc_recon_mean"]
+print(bench[cols].round(3).to_string())
+ax = bench[["auroc_splice", "auroc_glitch", "auroc_domain"]].plot.bar(figsize=(11, 3.6), rot=0)
+ax.axhline(0.5, c="k", ls=":", lw=1); ax.set_ylim(0, 1); ax.set_ylabel("AUROC: planted fakes vs real crops"); ax.set_xlabel("model")
+plt.title("Fig 4.3 - Planted-fakes benchmark by anomaly class (dotted = chance)"); plt.tight_layout(); savefig("fig14_benchmark.png"); plt.show()
 ''')
 md(open("CHANGELOG.md", encoding="utf-8").read().split("\n", 1)[1])   # the journal, verbatim
 

@@ -19,6 +19,8 @@ from scipy import ndimage, stats
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_SIZE = 227
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp")
+# bf16 autocast only where the GPU supports it natively (Ampere+); fp32 elsewhere, e.g. a Colab T4
+USE_BF16 = DEVICE.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8
 
 
 def seed_everything(seed=42):
@@ -26,6 +28,8 @@ def seed_everything(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True   # reproducible up to residual GPU non-determinism
+    torch.backends.cudnn.benchmark = False
 
 
 # === SECTION: configs ===
@@ -47,6 +51,14 @@ CONFIGS = {
     "v4": dict(model=dict(latent_dim=256, up="transpose", res_blocks=0, variational=False, spatial_latent=4),
                loss=dict(w_mse=0.0, w_l1=0.16, w_ssim=0.84, w_grad=0.1), epochs=30, lr=1e-3,
                nodata=True),
+    # v5: remove v3's brightness bias -> per-crop photometric normalisation (on top of v3)
+    "v5": dict(model=dict(latent_dim=256, up="transpose", res_blocks=0, variational=False),
+               loss=dict(w_mse=0.0, w_l1=0.16, w_ssim=0.84, w_grad=0.1), epochs=30, lr=1e-3,
+               nodata=True, standardize=True),
+    # v6: two-stage autoencoder -> stage 2 compresses stage 1's reconstruction residual into a
+    #     64-d code; final latent = [256-d scene code | 64-d residual code] (320-d, 1-D)
+    "v6": dict(model=dict(latent_dim=64, up="transpose", res_blocks=0, variational=False),
+               loss=dict(w_mse=1.0, w_l1=0.5), epochs=30, lr=1e-3, nodata=True, residual_of="v3"),
 }
 
 
@@ -113,6 +125,32 @@ def fill_nodata(X, M):
         valid = X[i][M[i] == 0]
         Xf[i][M[i] == 1] = np.uint8(np.median(valid)) if valid.size else 0
     return Xf
+
+
+def standardize_images(X, M=None, target_mean=0.5, target_std=0.15):
+    """Per-crop photometric normalisation: map each crop's valid pixels to a common mean and
+    contrast, so the latent describes structure rather than albedo / exposure / sun angle.
+    Pixels far from the crop's own statistics (a black bar, a hot line) stay extreme: they are
+    clipped at 0 / 255, not removed."""
+    Xs = np.empty_like(X)
+    for i in range(len(X)):
+        x = X[i].astype(np.float32)
+        v = x[M[i] == 0] if M is not None else x.ravel()
+        mu, sd = v.mean(), max(float(v.std()), 2.0)
+        Xs[i] = np.clip(np.round(255 * (target_mean + target_std * (x - mu) / sd)), 0, 255).astype(np.uint8)
+    return Xs
+
+
+def preprocess(cfg, X, mask_cache=None):
+    """Model input for a version: no-data masking + fill (configs with nodata=True) and
+    per-crop photometric normalisation (standardize=True). Returns (images_u8, masks_u8 or None)."""
+    M = None
+    if cfg.get("nodata"):
+        M = compute_nodata_masks(X, mask_cache)
+        X = fill_nodata(X, M)
+    if cfg.get("standardize"):
+        X = standardize_images(X, M)
+    return X, M
 
 
 # === SECTION: model ===
@@ -315,7 +353,7 @@ def train_autoencoder(model, images_u8, loss_fn, epochs=30, batch_size=64, lr=1e
         for s in range(steps):
             idx = torch.from_numpy(order[s * batch_size:(s + 1) * batch_size]).to(DEVICE)
             x, w = to_batch(X, idx, augment, M)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=DEVICE.type == "cuda"):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=USE_BF16):
                 xhat, mu, logvar = model(x)
             loss, parts = loss_fn(xhat.float(), x, mu.float(), None if logvar is None else logvar.float(), w)
             opt.zero_grad(set_to_none=True)
@@ -373,6 +411,47 @@ def embed_and_reconstruct(model, images_u8, masks_u8=None, batch_size=128):
         z, m_, s_ = _batch_metrics(model, X, idx, M, window)
         Z.append(z.cpu().numpy()); mse.append(m_.cpu().numpy()); ssim.append(s_.cpu().numpy())
     return np.concatenate(Z), np.concatenate(mse), np.concatenate(ssim)
+
+
+@torch.no_grad()
+def residual_images(model, images_u8, masks_u8=None, gain=4.0, batch_size=128):
+    """Stage-2 input of the two-stage autoencoder: the signed reconstruction residual of a trained
+    stage-1 model, amplified and mapped to uint8 as 128 + 127*clip(gain*(x - x_hat), -1, 1).
+    No-data pixels are set to 128 (zero residual)."""
+    model.eval().to(DEVICE)
+    X = torch.from_numpy(images_u8).to(DEVICE)
+    M = None if masks_u8 is None else torch.from_numpy(masks_u8).to(DEVICE)
+    out = np.empty_like(images_u8)
+    for s in range(0, len(X), batch_size):
+        idx = torch.arange(s, min(s + batch_size, len(X)), device=DEVICE)
+        x, w = to_batch(X, idx, False, M)
+        r = x - model(x)[0].float()
+        if w is not None:
+            r = r * w
+        out[s:s + len(idx)] = (128 + 127 * (gain * r).clamp(-1, 1)).round().squeeze(1).byte().cpu().numpy()
+    return out
+
+
+def load_model(v, out_dir):
+    m = ConvAE(**CONFIGS[v]["model"])
+    m.load_state_dict(torch.load(os.path.join(out_dir, v, "model.pt"), map_location=DEVICE))
+    return m.to(DEVICE).eval()
+
+
+def version_latents(v, X, out_dir, mask_cache=None):
+    """Final fixed-length 1-D latent per crop for version v, plus the stage-1 reconstruction
+    MSE / SSIM. Two-stage versions (residual_of=...) concatenate the stage-1 scene code with the
+    stage-2 code of the stage-1 reconstruction residual."""
+    cfg = CONFIGS[v]
+    if cfg.get("residual_of"):
+        base = cfg["residual_of"]
+        Xin, M = preprocess(CONFIGS[base], X, mask_cache)       # stage 1 sees exactly its own input
+        s1 = load_model(base, out_dir)
+        Z1, mse, ssim = embed_and_reconstruct(s1, Xin, M)
+        Z2, _, _ = embed_and_reconstruct(load_model(v, out_dir), residual_images(s1, Xin, M), M)
+        return np.hstack([Z1, Z2]), mse, ssim
+    Xin, M = preprocess(cfg, X, mask_cache)
+    return embed_and_reconstruct(load_model(v, out_dir), Xin, M)
 
 
 @torch.no_grad()
@@ -448,8 +527,14 @@ def error_map(orig, recon, smooth_sigma=2.0, valid=None):
     """Per-pixel squared error, lightly Gaussian-smoothed so structure is readable.
     If a validity map is given, no-data pixels are zeroed (they carry no terrain information)."""
     e = (orig - recon) ** 2
-    e = ndimage.gaussian_filter(e, smooth_sigma) if smooth_sigma else e
-    return e if valid is None else e * valid
+    if valid is None:
+        return ndimage.gaussian_filter(e, smooth_sigma) if smooth_sigma else e
+    if not smooth_sigma:
+        return e * valid
+    # validity-weighted smoothing: no-data pixels neither contribute error nor leak it into valid ones
+    num = ndimage.gaussian_filter(e * valid, smooth_sigma)
+    den = ndimage.gaussian_filter(valid.astype(float), smooth_sigma)
+    return np.where(valid > 0, num / np.maximum(den, 1e-6), 0.0)
 
 
 def heatmap_descriptors(orig, err, valid=None):
@@ -468,7 +553,8 @@ def heatmap_descriptors(orig, err, valid=None):
     v = np.ones_like(orig, bool) if valid is None else valid.astype(bool)
     flat = np.sort(err[v].ravel())[::-1]
     conc = flat[: max(1, len(flat) // 20)].sum() / max(flat.sum(), 1e-12)
-    rows, cols = err.mean(1), err.mean(0)
+    rows = (err * v).sum(1) / np.maximum(v.sum(1), 1)          # row / column means over valid pixels only
+    cols = (err * v).sum(0) / np.maximum(v.sum(0), 1)
     line = max(rows.max() / (np.median(rows) + 1e-12), cols.max() / (np.median(cols) + 1e-12))
     cr, cc = np.cumsum(orig.mean(1)), np.cumsum(orig.mean(0))
     n = orig.shape[0]

@@ -1,0 +1,2 @@
+model,n_flag_real,threshold,spot_flagged,rank_Pentagon,rank_orchard grid,rank_grid,rank_buildings,rank_black bar,rank_two streaks,rank_dead blocks,auroc_splice,auroc_glitch,auroc_domain,recall_splice,recall_glitch,recall_domain,auroc_mean,recall_mean,auroc_recon_mean
+v6,48,0.5250799390149763,3,6,1,3,156,344,2517,479,0.6504508091856969,0.7692746113989637,0.9115863877694621,0.018333333333333333,0.15416666666666667,0.15833333333333333,0.7751466049382716,0.12125,0.8350546320284015

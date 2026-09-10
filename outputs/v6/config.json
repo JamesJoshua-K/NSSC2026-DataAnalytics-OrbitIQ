@@ -1,0 +1,16 @@
+{
+ "model": {
+  "latent_dim": 64,
+  "up": "transpose",
+  "res_blocks": 0,
+  "variational": false
+ },
+ "loss": {
+  "w_mse": 1.0,
+  "w_l1": 0.5
+ },
+ "epochs": 30,
+ "lr": 0.001,
+ "nodata": true,
+ "residual_of": "v3"
+}
