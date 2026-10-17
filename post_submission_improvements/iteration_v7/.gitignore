@@ -1,0 +1,6 @@
+# outputs these scripts regenerate (large)
+runs/
+p2/
+p3/
+cache/
+__pycache__/
